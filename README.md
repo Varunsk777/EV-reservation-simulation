@@ -13,18 +13,6 @@ Users (vehicles) send reservation requests, and the system dynamically assigns c
 
 ## 🎯 Key Features
 
-* ⚡ Priority-based scheduling
-
-  * **Priority 1** → Emergency vehicles (Ambulance, Fire Truck)
-  * **Priority 2** → VIP / Government vehicles
-  * **Priority 3** → Normal vehicles
-
-* 🧠 Multi-Agent Architecture
-
-  * User Agent
-  * Coordinator Agent
-  * Charging Station Agent
-
 * 🔄 Real-time Simulation
 
   * Dynamic slot allocation
@@ -120,32 +108,5 @@ python main.py
 
 ---
 
-## 📊 Future Enhancements
 
-* 🌐 Web-based UI dashboard
-* 📈 Real-time visualization of station load
-* 🤖 AI-based scheduling (RL / DQN integration)
-* 📱 Mobile app for booking slots
-* ☁️ Cloud deployment (AWS / Docker)
 
----
-
-## 🤝 Contribution
-
-Contributions are welcome!
-Feel free to fork the repo and submit a pull request.
-
----
-
-## 👨‍💻 Author
-
-**Varun S Kumar**
-Aspiring AI & Data Science Engineer
-
----
-
-## 📜 License
-
-This project is open-source and available under the MIT License.
-
----
