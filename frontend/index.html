@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EV Charging Coordinator Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="page-header surface">
+      <div>
+        <p class="eyebrow">Realtime Simulation Monitor</p>
+        <h1>EV Charging Coordinator Dashboard</h1>
+      </div>
+      <div class="header-meta">
+        <div class="simulation-controls">
+          <label class="iterations-control">
+            <span>Iterations</span>
+            <input id="iterations-input" type="number" min="1" max="200" value="12">
+          </label>
+          <button id="start-simulation-button" class="start-button" type="button">Start Simulation</button>
+        </div>
+        <div class="live-indicator">
+          <span class="live-dot"></span>
+          <span id="connection-status">Connecting</span>
+        </div>
+        <p id="last-updated" class="meta-copy">Waiting for first update</p>
+      </div>
+    </header>
+
+    <section class="stats-grid">
+      <article class="stat-card surface">
+        <p class="stat-label">Total Requests</p>
+        <h2 id="stat-total" class="stat-value">0</h2>
+      </article>
+      <article class="stat-card surface">
+        <p class="stat-label">Success</p>
+        <h2 id="stat-success" class="stat-value success-text">0</h2>
+      </article>
+      <article class="stat-card surface">
+        <p class="stat-label">Failed</p>
+        <h2 id="stat-failed" class="stat-value failure-text">0</h2>
+      </article>
+    </section>
+
+    <main class="main-grid">
+      <section class="surface panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Station Overview</p>
+            <h3>Charging Stations</h3>
+          </div>
+          <span id="station-count" class="panel-chip">0 Stations</span>
+        </div>
+        <div id="stations-grid" class="stations-grid"></div>
+      </section>
+
+      <section class="surface panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Activity Stream</p>
+            <h3>Live Requests Feed</h3>
+          </div>
+          <span class="panel-chip">1s refresh</span>
+        </div>
+        <div id="requests-feed" class="feed-list"></div>
+      </section>
+    </main>
+
+    <section class="surface panel logs-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">System Trace</p>
+          <h3>Logs</h3>
+        </div>
+        <span class="panel-chip">Latest events</span>
+      </div>
+      <div id="logs-list" class="logs-list"></div>
+    </section>
+  </div>
+
+  <template id="station-card-template">
+    <article class="station-card">
+      <div class="station-header">
+        <div>
+          <p class="station-label">Station</p>
+          <h4 class="station-title"></h4>
+        </div>
+        <span class="station-summary"></span>
+      </div>
+      <div class="slot-badges"></div>
+    </article>
+  </template>
+
+  <template id="feed-item-template">
+    <article class="feed-item">
+      <div class="feed-main"></div>
+      <span class="feed-status"></span>
+    </article>
+  </template>
+
+  <template id="log-item-template">
+    <article class="log-item">
+      <span class="log-time"></span>
+      <p class="log-message"></p>
+    </article>
+  </template>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
