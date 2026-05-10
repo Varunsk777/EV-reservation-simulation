@@ -179,6 +179,9 @@ select {
 
 .charging { color: #67e8f9; }
 .reserved { color: #fbbf24; }
+.waiting { color: #fde68a; }
+.completed { color: #cbd5e1; }
+.released { color: #94a3b8; }
 .available { color: #86efac; }
 .fault { color: #fca5a5; }
 
@@ -241,8 +244,12 @@ select {
 
 .charger-rows {
   display: grid;
-  gap: 7px;
+  gap: 10px;
   padding: 8px 14px 14px;
+}
+
+.station-timeline-shell {
+  position: relative;
 }
 
 .charger-label {
@@ -265,32 +272,105 @@ select {
   gap: 2px;
   border-radius: 5px;
   overflow: hidden;
+  background: rgba(8, 14, 26, 0.55);
 }
 
 .segment {
   min-width: 0;
   border-radius: 2px;
-  background: rgba(34, 197, 94, 0.18);
-  border: 1px solid rgba(34, 197, 94, 0.24);
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  opacity: 0.62;
+  transition:
+    background-color 380ms ease,
+    border-color 380ms ease,
+    opacity 380ms ease,
+    box-shadow 420ms ease,
+    transform 260ms ease;
 }
 
 .segment.available {
-  background: rgba(34, 197, 94, 0.18);
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(134, 239, 172, 0.2);
 }
 
 .segment.reserved {
-  background: rgba(245, 158, 11, 0.82);
-  border-color: rgba(251, 191, 36, 0.9);
+  background: rgba(217, 119, 6, 0.46);
+  border-color: rgba(251, 191, 36, 0.44);
+}
+
+.segment.waiting {
+  background: rgba(250, 204, 21, 0.54);
+  border-color: rgba(254, 240, 138, 0.6);
 }
 
 .segment.charging {
-  background: rgba(56, 189, 248, 0.9);
+  background: rgba(14, 165, 233, 0.8);
   border-color: rgba(103, 232, 249, 0.9);
 }
 
+.segment.completed {
+  background: rgba(148, 163, 184, 0.26);
+  border-color: rgba(203, 213, 225, 0.34);
+}
+
 .segment.fault {
-  background: rgba(239, 68, 68, 0.9);
-  border-color: rgba(252, 165, 165, 0.9);
+  background: rgba(220, 38, 38, 0.55);
+  border-color: rgba(252, 165, 165, 0.62);
+}
+
+.segment.past {
+  opacity: 0.24;
+  filter: saturate(0.7);
+}
+
+.segment.future {
+  opacity: 0.56;
+}
+
+.segment.current {
+  opacity: 0.95;
+}
+
+.segment.charging.current {
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5), 0 0 14px rgba(34, 211, 238, 0.35);
+}
+
+.segment.charging.active {
+  animation: chargePulse 1.5s ease-in-out infinite;
+}
+
+.current-time-cursor {
+  position: absolute;
+  top: 38px;
+  bottom: 16px;
+  width: 2px;
+  transform: translateX(-1px);
+  background: linear-gradient(180deg, rgba(125, 211, 252, 0.95), rgba(56, 189, 248, 0.85));
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.38), 0 0 16px rgba(56, 189, 248, 0.44);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.current-time-cursor::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: -4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(186, 230, 253, 0.95);
+  box-shadow: 0 0 14px rgba(125, 211, 252, 0.9);
+}
+
+@keyframes chargePulse {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.52), 0 0 10px rgba(34, 211, 238, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.7), 0 0 16px rgba(34, 211, 238, 0.48);
+  }
 }
 
 .free-window-strip {
@@ -488,6 +568,10 @@ select {
 
   .time-axis {
     display: none;
+  }
+
+  .current-time-cursor {
+    top: 8px;
   }
 
   .charger-row {

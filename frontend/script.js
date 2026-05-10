@@ -1,9 +1,14 @@
-const lifecycleStates = ["Searching", "Reserved", "Waiting", "Charging", "Completed"];
+const lifecycleStates = ["Searching", "Reserved", "Waiting", "Charging", "Completed", "Released"];
+const BASE_TICK_SECONDS = 3.2;
+const MIN_TICK_SECONDS = 0.45;
+const knownSegmentStates = new Set(["available", "reserved", "waiting", "charging", "completed", "fault"]);
 
 const state = {
   socket: null,
   payload: null,
   connected: false,
+  clockAnchor: null,
+  animationFrame: null,
 };
 
 const els = {
@@ -68,6 +73,8 @@ function renderControls(clock) {
   els.simTime.textContent = fmtTime(clock.current_time);
   els.playPause.textContent = clock.paused || !clock.running ? "Play" : "Pause";
   if (clock.speed) els.speedSelect.value = String(clock.speed);
+  syncClockAnchor(clock);
+  ensureTimelineAnimation();
 }
 
 function renderMetrics(metrics) {
@@ -83,10 +90,11 @@ function renderStations(stations) {
     return;
   }
 
-  els.stationTimelines.replaceChildren(...stations.map(renderStation));
+  const simNowMs = getSimNowMs();
+  els.stationTimelines.replaceChildren(...stations.map((station) => renderStation(station, simNowMs)));
 }
 
-function renderStation(station) {
+function renderStation(station, simNowMs) {
   const details = document.createElement("details");
   details.className = "station-panel";
   details.open = true;
@@ -102,6 +110,9 @@ function renderStation(station) {
   `;
   details.appendChild(summary);
 
+  const timeline = document.createElement("div");
+  timeline.className = "station-timeline-shell";
+
   const axis = document.createElement("div");
   axis.className = "time-axis";
   axis.appendChild(document.createElement("span"));
@@ -110,14 +121,22 @@ function renderStation(station) {
     label.textContent = fmtTime(tick);
     axis.appendChild(label);
   }
-  details.appendChild(axis);
+  timeline.appendChild(axis);
 
   const rows = document.createElement("div");
   rows.className = "charger-rows";
   for (const charger of station.chargers || []) {
-    rows.appendChild(renderChargerRow(charger));
+    rows.appendChild(renderChargerRow(charger, simNowMs));
   }
-  details.appendChild(rows);
+  timeline.appendChild(rows);
+
+  const { startMs, endMs } = getStationTimeBounds(station);
+  const cursor = document.createElement("div");
+  cursor.className = "current-time-cursor";
+  cursor.dataset.startMs = String(startMs);
+  cursor.dataset.endMs = String(endMs);
+  timeline.appendChild(cursor);
+  details.appendChild(timeline);
 
   const windows = document.createElement("div");
   windows.className = "free-window-strip";
@@ -138,7 +157,7 @@ function renderStation(station) {
   return details;
 }
 
-function renderChargerRow(charger) {
+function renderChargerRow(charger, simNowMs) {
   const row = document.createElement("div");
   row.className = "charger-row";
 
@@ -151,7 +170,14 @@ function renderChargerRow(charger) {
   track.className = "timeline-track";
   for (const segment of charger.segments || []) {
     const block = document.createElement("span");
-    block.className = `segment ${segment.status}`;
+    const status = normalizeSegmentStatus(segment.status);
+    block.className = `segment ${status} ${segmentPhase(segment.start, segment.end, simNowMs)}`;
+    block.dataset.startMs = String(Date.parse(segment.start));
+    block.dataset.endMs = String(Date.parse(segment.end));
+    block.dataset.status = status;
+    if (status === "charging" && isCurrentSegment(segment.start, segment.end, simNowMs)) {
+      block.classList.add("active");
+    }
     block.title = `${fmtWindow(segment.start, segment.end)} ${segment.status}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
     track.appendChild(block);
   }
@@ -166,7 +192,7 @@ function renderDecision(decision) {
     <div class="candidate-row ${candidate.station_id === selected ? "selected" : ""}">
       <span>${candidate.station_name}</span>
       <strong>${candidate.wait_minutes >= 999 ? "No fit" : `${candidate.wait_minutes} min`}</strong>
-      <em>score ${candidate.score}</em>
+      <em>score ${candidate.score}${candidate.rejection_reason ? ` • ${candidate.rejection_reason.replaceAll("_", " ")}` : ""}</em>
     </div>
   `).join("");
 
@@ -196,9 +222,10 @@ function renderLifecycle(vehicles) {
     for (const vehicle of items) {
       const card = document.createElement("div");
       card.className = "vehicle-chip";
+      const phase = vehicle.coordination_phase ? ` · ${vehicle.coordination_phase}` : "";
       card.innerHTML = `
         <strong>${vehicle.vehicle_id}</strong>
-        <span>${vehicle.assigned_station ? `S${vehicle.assigned_station} C${vehicle.assigned_charger}` : `SOC ${vehicle.soc || "--"}%`}</span>
+        <span>${vehicle.assigned_station ? `S${vehicle.assigned_station} C${vehicle.assigned_charger}` : `SOC ${vehicle.soc || "--"}%`}${phase}</span>
       `;
       column.appendChild(card);
     }
@@ -217,12 +244,128 @@ function renderEvents(events) {
     row.innerHTML = `
       <time>${fmtTime(event.timestamp)}</time>
       <div>
-        <strong>${String(event.event_type || "").replaceAll("_", " ")}</strong>
+        <strong>${formatEventType(event.event_type)}</strong>
         <p>${event.message || event.event_message || ""}</p>
       </div>
     `;
     return row;
   }));
+}
+
+function tickMinutes(speed) {
+  return Math.max(3, Math.min(18, 3 + Number(speed) * 2));
+}
+
+function tickDelay(speed) {
+  return Math.max(MIN_TICK_SECONDS, BASE_TICK_SECONDS / Math.max(1, Number(speed)));
+}
+
+function simulationMinutesPerSecond(speed) {
+  return tickMinutes(speed) / tickDelay(speed);
+}
+
+function syncClockAnchor(clock) {
+  const parsed = Date.parse(clock.current_time);
+  if (Number.isNaN(parsed)) return;
+  const speed = Number(clock.speed || 1);
+  state.clockAnchor = {
+    simMs: parsed,
+    speed,
+    paused: Boolean(clock.paused || !clock.running),
+    realMs: performance.now(),
+  };
+}
+
+function getSimNowMs() {
+  if (!state.clockAnchor) return Date.now();
+  if (state.clockAnchor.paused) return state.clockAnchor.simMs;
+  const elapsedSeconds = Math.max(0, (performance.now() - state.clockAnchor.realMs) / 1000);
+  return state.clockAnchor.simMs + elapsedSeconds * simulationMinutesPerSecond(state.clockAnchor.speed) * 60_000;
+}
+
+function getStationTimeBounds(station) {
+  const firstCharger = station.chargers?.[0];
+  const firstSegment = firstCharger?.segments?.[0];
+  const lastSegment = firstCharger?.segments?.[firstCharger?.segments?.length - 1];
+  const axis = station.time_axis || [];
+  const startMs = Date.parse(firstSegment?.start || axis[0] || Date.now());
+  const endMs = Date.parse(lastSegment?.end || axis[axis.length - 1] || Date.now() + 1);
+  return { startMs, endMs };
+}
+
+function segmentPhase(start, end, nowMs) {
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return "future";
+  if (endMs <= nowMs) return "past";
+  if (startMs > nowMs) return "future";
+  return "current";
+}
+
+function isCurrentSegment(start, end, nowMs) {
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  return !Number.isNaN(startMs) && !Number.isNaN(endMs) && startMs <= nowMs && nowMs < endMs;
+}
+
+function normalizeSegmentStatus(status) {
+  return knownSegmentStates.has(status) ? status : "available";
+}
+
+function updateTimelineDynamics(simNowMs) {
+  document.querySelectorAll(".current-time-cursor").forEach((cursor) => {
+    const startMs = Number(cursor.dataset.startMs);
+    const endMs = Number(cursor.dataset.endMs);
+    const span = Math.max(1, endMs - startMs);
+    const ratio = Math.max(0, Math.min(1, (simNowMs - startMs) / span));
+    cursor.style.left = `${ratio * 100}%`;
+  });
+
+  document.querySelectorAll(".timeline-track .segment").forEach((segment) => {
+    const startMs = Number(segment.dataset.startMs);
+    const endMs = Number(segment.dataset.endMs);
+    const status = segment.dataset.status || "available";
+    const past = endMs <= simNowMs;
+    const current = startMs <= simNowMs && simNowMs < endMs;
+    segment.classList.toggle("past", past);
+    segment.classList.toggle("current", current);
+    segment.classList.toggle("future", !past && !current);
+    segment.classList.toggle("active", status === "charging" && current);
+  });
+}
+
+function ensureTimelineAnimation() {
+  if (state.animationFrame) return;
+  const loop = () => {
+    if (state.payload) {
+      updateTimelineDynamics(getSimNowMs());
+    }
+    state.animationFrame = window.requestAnimationFrame(loop);
+  };
+  state.animationFrame = window.requestAnimationFrame(loop);
+}
+
+function formatEventType(eventType) {
+  const labels = {
+    slot_reserved: "Reserved",
+    vehicle_waiting: "Waiting",
+    charging_started: "Charging started",
+    charging_completed: "Charging completed",
+    slot_released: "Charger released",
+    reservation_created: "Reservation created",
+    reservation_cancelled: "Reservation cancelled",
+    coordinator_decision: "Coordinator decision",
+    queue_updated: "Queue updated",
+    conflict_detected: "Conflict detected",
+    rerouting: "Rerouting",
+    queue_overflow: "Queue overflow",
+    priority_preempted: "Priority preempted",
+    allocating: "Allocating",
+    conflict_escalating: "Conflict escalating",
+    allocation_retry: "Allocation retry",
+    station_congestion: "Station congestion",
+  };
+  return labels[eventType] || String(eventType || "").replaceAll("_", " ");
 }
 
 function connectWebSocket() {

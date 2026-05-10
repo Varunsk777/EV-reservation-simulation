@@ -33,13 +33,33 @@ EVENT_TYPES = {
     "vehicle_waiting",
     "coordinator_decision",
     "reservation_cancelled",
+    "conflict_detected",
+    "rerouting",
+    "queue_overflow",
+    "priority_preempted",
+    "allocating",
+    "conflict_escalating",
+    "allocation_retry",
+    "station_congestion",
 }
-LIFECYCLE = ("Searching", "Reserved", "Waiting", "Charging", "Completed")
+LIFECYCLE = ("Searching", "Reserved", "Waiting", "Charging", "Completed", "Released")
 LOCK_TTL_SECONDS = 240
 SEGMENT_MINUTES = 15
 HORIZON_HOURS = 3
+PAST_WINDOW_MINUTES = 45
 MIN_TICK_SECONDS = 0.45
 BASE_TICK_SECONDS = 3.2
+QUEUE_KEY = "sim:pending_queue"
+ARRIVAL_BUFFER_KEY = "sim:arrival_buffer"
+TICK_COUNTER_KEY = "sim:tick_counter"
+PHASE_MINUTES = 30
+# Tuned for ~50–70% occupancy, staggered load, and visible queue pressure (not empty, not saturated).
+PHASES = (
+    {"name": "Low Traffic", "arrival_per_hour": 5.2, "retry_budget": 4, "overflow_threshold": 28},
+    {"name": "Moderate Demand", "arrival_per_hour": 8.0, "retry_budget": 5, "overflow_threshold": 36},
+    {"name": "Peak Congestion", "arrival_per_hour": 11.0, "retry_budget": 6, "overflow_threshold": 46},
+    {"name": "Recovery Phase", "arrival_per_hour": 6.0, "retry_budget": 4, "overflow_threshold": 32},
+)
 
 
 @dataclass
@@ -345,12 +365,16 @@ class OrchestrationService:
             clock.current_time = clock.current_time + timedelta(minutes=self._tick_minutes(clock.speed))
             self._write_clock(clock)
             logger.info("Simulation tick: sim_time=%s speed=%s", clock.current_time.isoformat(), clock.speed)
+            tick_n = self._bump_tick_counter()
             self._advance_lifecycles(clock.current_time)
-            request_count = self._requests_per_tick(clock.speed)
-            logger.info("Vehicle generation loop: creating %s request(s)", request_count)
-            for _ in range(request_count):
-                self._generate_vehicle_request(clock.current_time)
+            phase = self._traffic_phase(clock.current_time)
+            self._ingest_arrivals(clock.current_time, clock.speed, phase)
+            self._drain_arrival_buffer(clock.current_time, phase, tick_n)
+            self._advance_pending_queue(clock.current_time, phase)
+            self._decay_coordination_phases(clock.current_time)
             self._advance_lifecycles(clock.current_time)
+            self._scan_terminal_vehicle_phases(clock.current_time)
+            self._emit_congestion_pressure(clock.current_time, tick_n)
             self._publish_snapshot()
 
     @staticmethod
@@ -363,10 +387,177 @@ class OrchestrationService:
 
     @staticmethod
     def _requests_per_tick(speed: int) -> int:
-        base = 2 + min(4, int(speed) // 2)
-        jitter = random.randint(0, 3)
-        surge = random.randint(2, 5) if random.random() < min(0.35, 0.08 + int(speed) * 0.015) else 0
+        base = 1 + min(2, int(speed) // 3)
+        jitter = random.randint(0, 1)
+        surge = random.randint(1, 2) if random.random() < min(0.2, 0.05 + int(speed) * 0.01) else 0
         return base + jitter + surge
+
+    @staticmethod
+    def _poisson_sample(mean: float) -> int:
+        if mean <= 0:
+            return 0
+        threshold = pow(2.718281828459045, -mean)
+        k = 0
+        p = 1.0
+        while p > threshold:
+            k += 1
+            p *= random.random()
+        return k - 1
+
+    def _traffic_phase(self, now: datetime) -> dict[str, Any]:
+        minute_of_day = now.hour * 60 + now.minute
+        idx = (minute_of_day // PHASE_MINUTES) % len(PHASES)
+        phase = dict(PHASES[idx])
+        phase["index"] = idx
+        return phase
+
+    @staticmethod
+    def _vehicle_timing_jitter(vehicle_id: str) -> tuple[int, int]:
+        """Stable plug-in delay and post-charge linger (simulated minutes)."""
+        h = hash(vehicle_id) & 0xFFFFFFFF
+        plug_min = 4 + (h % 6) * 2  # 4–14
+        linger_min = 3 + ((h >> 6) % 6) * 2  # 3–13 after nominal end before DB completes
+        return plug_min, linger_min
+
+    def _balanced_preferred_station(self) -> int:
+        raw = self._redis_get_json(TICK_COUNTER_KEY)
+        n = int(raw) if raw is not None else 0
+        primary = (n % len(STATION_LIMITS)) + 1
+        if random.random() < 0.35:
+            alts = [s for s in STATION_LIMITS if s != primary]
+            return random.choice(alts) if alts else primary
+        return primary
+
+    def _bump_tick_counter(self) -> int:
+        raw = self._redis_get_json(TICK_COUNTER_KEY)
+        try:
+            current = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            current = 0
+        nxt = current + 1
+        self._redis_set_json(TICK_COUNTER_KEY, nxt)
+        return nxt
+
+    def _read_arrival_buffer(self) -> list[dict[str, Any]]:
+        return self._redis_get_json(ARRIVAL_BUFFER_KEY) or []
+
+    def _write_arrival_buffer(self, buf: list[dict[str, Any]]) -> None:
+        self._redis_set_json(ARRIVAL_BUFFER_KEY, buf[-220:])
+
+    def _drain_arrival_buffer(self, now: datetime, phase: dict[str, Any], tick_n: int) -> None:
+        buf = self._read_arrival_buffer()
+        if not buf:
+            return
+        cap = random.choice([1, 2]) if phase["index"] <= 2 else random.choice([1, 2, 2])
+        if tick_n % 4 == 0:
+            cap = min(cap + 1, 3)
+        batch = []
+        remainder = []
+        for item in buf:
+            if len(batch) < cap:
+                jitter = timedelta(minutes=random.choice([0, 0, 2, 4]))
+                item["next_retry_at"] = max(
+                    datetime.fromisoformat(item.get("next_retry_at", now.isoformat())),
+                    now + jitter,
+                ).isoformat()
+                batch.append(item)
+            else:
+                remainder.append(item)
+        for item in batch:
+            self._enqueue_vehicle(item, "staggered_intake", now)
+        self._write_arrival_buffer(remainder)
+
+    @staticmethod
+    def _failure_narrative(
+        reason: str, vehicle_id: str, attempts: int, preferred: int | None = None
+    ) -> tuple[str, str]:
+        station_hint = ""
+        if preferred:
+            station_hint = f" (preferred Station {preferred})"
+        if attempts >= 4:
+            return (
+                "conflict_escalating",
+                f"{vehicle_id}: sustained contention after {attempts} allocation passes — backoff lengthened.",
+            )
+        messages = {
+            "interval_collision": (
+                f"{vehicle_id} blocked by overlapping reservation window — coordinator will retry{station_hint}."
+            ),
+            "fragmentation_failure": (
+                f"{vehicle_id} waiting due to fragmented availability — no uninterrupted charging block{station_hint}."
+            ),
+            "station_saturation": (
+                f"{vehicle_id} waiting: station saturation; allocation deferred to a later orchestration cycle."
+            ),
+            "no_fit": (f"{vehicle_id} deferred: coordinated window not yet available across the mesh."),
+        }
+        return ("conflict_detected", messages.get(reason, messages["no_fit"]))
+
+    def _scan_terminal_vehicle_phases(self, now: datetime) -> None:
+        """Complete to Released linger, then remove completed vehicles from the active roster."""
+        for key in list(self._redis_keys("vehicle:*:state")):
+            payload = self._redis_get_json(key)
+            if not payload or not payload.get("vehicle_id"):
+                continue
+            status = payload.get("status")
+            if status == "Completed":
+                cu = payload.get("completed_until")
+                if cu and now >= datetime.fromisoformat(cu):
+                    merged = dict(payload)
+                    merged["status"] = "Released"
+                    merged.pop("completed_until", None)
+                    merged["released_until"] = (
+                        now + timedelta(minutes=6 + random.randint(0, 5))
+                    ).isoformat()
+                    merged.pop("coordination_phase", None)
+                    self._redis_set_json(key, merged)
+                    self._publish_event(
+                        None,
+                        payload["vehicle_id"],
+                        "queue_updated",
+                        f"{payload['vehicle_id']} session handoff complete — leaving active coordination roster.",
+                    )
+            elif status == "Released":
+                ru = payload.get("released_until")
+                if ru and now >= datetime.fromisoformat(ru):
+                    self._redis_delete(key)
+
+    def _decay_coordination_phases(self, _now: datetime) -> None:
+        """Drop short-lived coordination labels after one visible tick."""
+        for key in list(self._redis_keys("vehicle:*:state")):
+            payload = self._redis_get_json(key)
+            if not payload or payload.get("coordination_phase") != "REROUTING":
+                continue
+            if str(payload.get("status")) != "Reserved":
+                continue
+            rid = payload.get("reservation_id")
+            if rid is None:
+                continue
+            merged = dict(payload)
+            merged.pop("coordination_phase", None)
+            merged["reroute_note"] = (
+                f"Reroute applied; session anchored at Station {payload.get('assigned_station')}."
+            )
+            self._redis_set_json(key, merged)
+
+    def _emit_congestion_pressure(self, now: datetime, tick_n: int) -> None:
+        if tick_n % 3 != 0:
+            return
+        for station_id, charger_count in STATION_LIMITS.items():
+            live = self._redis_hgetall(f"station:{station_id}:slots:live")
+            occupied = sum(
+                1 for cid in range(1, charger_count + 1) if live.get(str(cid), "free") != "free"
+            )
+            ratio = occupied / max(1, charger_count)
+            if ratio < 0.68:
+                continue
+            self._publish_event(
+                station_id,
+                None,
+                "station_congestion",
+                f"{STATION_NAMES[station_id]} congestion threshold exceeded "
+                f"({occupied}/{charger_count} bays in active orchestration).",
+            )
 
     def _seed_small_station_set(self) -> None:
         with db_connection() as conn:
@@ -421,16 +612,28 @@ class OrchestrationService:
         intervals_by_station: dict[int, list[dict[str, Any]]] = {station_id: [] for station_id in STATION_LIMITS}
         for row in rows:
             status = self._interval_status(row, now)
+            vid = str(row.get("vehicle_id") or "")
+            _plug_m, linger_m = self._vehicle_timing_jitter(vid)
+            nominal_end = row["reservation_end"]
+            eff_end = nominal_end + timedelta(minutes=linger_m)
+            display_end = nominal_end
+            if str(row["reservation_status"]).lower() == "charging" and now < eff_end:
+                display_end = eff_end
             interval = {
                 "reservation_id": row["id"],
                 "charger_id": row["charger_id"],
                 "vehicle_id": row["vehicle_id"],
                 "start": row["reservation_start"].isoformat(),
-                "end": row["reservation_end"].isoformat(),
+                "end": display_end.isoformat(),
                 "status": status,
             }
             intervals_by_station.setdefault(row["station_id"], []).append(interval)
-            if status in {"reserved", "charging"}:
+            st = row["reservation_start"]
+            if status == "waiting" and st <= now:
+                self._redis_hset(
+                    f"station:{row['station_id']}:slots:live", str(row["charger_id"]), "waiting"
+                )
+            elif status in {"reserved", "charging"}:
                 self._redis_hset(f"station:{row['station_id']}:slots:live", str(row["charger_id"]), status)
         for station_id, intervals in intervals_by_station.items():
             self._write_station_timeline(station_id, intervals)
@@ -438,13 +641,16 @@ class OrchestrationService:
     def _station_timeline_snapshot(self, now: datetime) -> list[dict[str, Any]]:
         self._hydrate_from_postgres()
         stations = []
-        ticks = [now + timedelta(minutes=30 * i) for i in range(0, HORIZON_HOURS * 2 + 1)]
+        window_start = now - timedelta(minutes=PAST_WINDOW_MINUTES)
+        window_end = window_start + timedelta(hours=HORIZON_HOURS)
+        tick_count = int((window_end - window_start).total_seconds() // (30 * 60))
+        ticks = [window_start + timedelta(minutes=30 * i) for i in range(0, tick_count + 1)]
         for station_id, charger_count in STATION_LIMITS.items():
             intervals = self._read_station_timeline(station_id)
             live = self._redis_hgetall(f"station:{station_id}:slots:live")
             chargers = []
             for charger_id in range(1, charger_count + 1):
-                segments = self._build_segments(charger_id, now, intervals)
+                segments = self._build_segments(charger_id, window_start, intervals)
                 chargers.append(
                     {
                         "charger_id": charger_id,
@@ -510,57 +716,225 @@ class OrchestrationService:
         return windows
 
     def _generate_vehicle_request(self, now: datetime) -> None:
+        # Backward-compatible entrypoint used by older flows.
+        self._enqueue_vehicle(self._new_vehicle_request(now), "arrival_wave", now)
+
+    def _new_vehicle_request(self, now: datetime) -> dict[str, Any]:
         vehicle_id = f"EV-{int(time.time() * 1000)}-{random.randint(100, 999)}"
-        priority = random.choice([1, 1, 2, 2, 3])
-        duration = timedelta(minutes=random.choice([30, 30, 45, 45, 60, 75, 90]))
-        earliest = now + timedelta(minutes=random.choice([0, 0, 5, 10, 15, 20, 30, 45]))
-        logger.info(
-            "Vehicle created: vehicle_id=%s priority=%s earliest=%s duration_minutes=%s",
-            vehicle_id,
-            priority,
-            earliest.isoformat(),
-            int(duration.total_seconds() / 60),
+        preferred = self._balanced_preferred_station()
+        emergency = random.random() < 0.07
+        priority = 4 if emergency else random.choice([1, 1, 2, 2, 2, 3])
+        duration = timedelta(minutes=random.choice([30, 40, 45, 55, 60, 65, 75, 85, 90]))
+        earliest_offset = random.choice([5, 10, 12, 15, 18, 22, 28, 35, 40, 50])
+        earliest = now + timedelta(minutes=earliest_offset)
+        return {
+            "vehicle_id": vehicle_id,
+            "priority": priority,
+            "duration_minutes": int(duration.total_seconds() / 60),
+            "earliest": earliest.isoformat(),
+            "soc": random.randint(18, 62),
+            "attempts": 0,
+            "queued_at": now.isoformat(),
+            "next_retry_at": now.isoformat(),
+            "emergency": emergency,
+            "preferred_station": preferred,
+        }
+
+    def _ingest_arrivals(self, now: datetime, speed: int, phase: dict[str, Any]) -> None:
+        tick_hours = self._tick_minutes(speed) / 60.0
+        mean = float(phase["arrival_per_hour"]) * tick_hours
+        arrivals = max(0, self._poisson_sample(mean))
+        if arrivals <= 0:
+            return
+        buf = self._read_arrival_buffer()
+        burst_cap = max(1, min(5, arrivals))
+        arrivals = min(arrivals, burst_cap)
+        for _ in range(arrivals):
+            buf.append(self._new_vehicle_request(now))
+        self._write_arrival_buffer(buf)
+        if arrivals:
+            self._publish_event(
+                station_id=None,
+                vehicle_id=None,
+                event_type="queue_updated",
+                message=(
+                    f"Demand wave: +{arrivals} inbound vehicle(s) during {phase['name']} — "
+                    "staggered entry into orchestration queues."
+                ),
+            )
+
+    def _enqueue_vehicle(self, request: dict[str, Any], reason: str, now: datetime) -> None:
+        queue = self._read_pending_queue()
+        queue.append(request)
+        preempted = False
+        if request.get("emergency"):
+            for item in queue[:-1]:
+                if int(item.get("priority", 1)) <= 1 and not item.get("emergency"):
+                    cur = datetime.fromisoformat(item.get("next_retry_at", now.isoformat()))
+                    item["next_retry_at"] = (cur + timedelta(minutes=random.randint(6, 15))).isoformat()
+                    preempted = True
+                    self._publish_event(
+                        station_id=None,
+                        vehicle_id=item["vehicle_id"],
+                        event_type="priority_preempted",
+                        message=(
+                            f"Emergency vehicle {request['vehicle_id']} preempted queue order; "
+                            f"{item['vehicle_id']} allocation retry delayed."
+                        ),
+                    )
+                    break
+        self._write_pending_queue(queue)
+        self._redis_set_json(
+            f"vehicle:{request['vehicle_id']}:state",
+            {
+                "status": "Searching",
+                "vehicle_id": request["vehicle_id"],
+                "soc": request.get("soc"),
+                "priority": request["priority"],
+                "queue_attempts": request.get("attempts", 0),
+                "queued_at": request.get("queued_at"),
+            },
         )
-        user_id = self._ensure_user(vehicle_id, priority)
-        decision = self._choose_interval(vehicle_id, priority, earliest, duration)
-        logger.info(
-            "Coordinator decision: vehicle_id=%s selected_station=%s allocation=%s",
-            vehicle_id,
-            decision.get("selected_station"),
-            decision.get("allocation"),
+        if request.get("emergency"):
+            self._publish_event(
+                station_id=None,
+                vehicle_id=request["vehicle_id"],
+                event_type="priority_preempted",
+                message=(
+                    f"{request['vehicle_id']} registered as emergency priority — expedited orchestration."
+                    + ("" if preempted else " No lower-priority deferrals required this cycle.")
+                ),
+            )
+
+    def _advance_pending_queue(self, now: datetime, phase: dict[str, Any]) -> None:
+        queue = self._read_pending_queue()
+        if not queue:
+            return
+        overflow = int(phase["overflow_threshold"])
+        if len(queue) >= overflow:
+            self._publish_event(
+                station_id=None,
+                vehicle_id=None,
+                event_type="queue_overflow",
+                message=f"Queue overflow threshold reached ({len(queue)} pending) during {phase['name']}.",
+            )
+        queue.sort(
+            key=lambda item: (
+                -int(item.get("priority", 1)),
+                -int(bool(item.get("emergency"))),
+                datetime.fromisoformat(item.get("queued_at", now.isoformat())),
+                item.get("vehicle_id", ""),
+            )
+        )
+        processed = 0
+        survivors: list[dict[str, Any]] = []
+        max_try = min(int(phase["retry_budget"]), 3)
+        for item in queue:
+            next_retry_at = datetime.fromisoformat(item.get("next_retry_at", now.isoformat()))
+            if next_retry_at > now:
+                survivors.append(item)
+                continue
+            processed += 1
+            if processed > max_try:
+                survivors.append(item)
+                continue
+            if not self._attempt_allocation(item, now, len(queue)):
+                survivors.append(item)
+        self._write_pending_queue(survivors)
+
+    def _attempt_allocation(self, request: dict[str, Any], now: datetime, queue_size: int) -> bool:
+        vehicle_id = request["vehicle_id"]
+        priority = int(request["priority"])
+        duration = timedelta(minutes=int(request["duration_minutes"]))
+        earliest = max(now, datetime.fromisoformat(request["earliest"]))
+        prev_state = self._redis_get_json(f"vehicle:{vehicle_id}:state") or {}
+        alloc_payload = {
+            **prev_state,
+            "status": "Waiting" if int(request.get("attempts", 0)) > 0 else "Searching",
+            "vehicle_id": vehicle_id,
+            "soc": request.get("soc"),
+            "priority": priority,
+            "queue_attempts": request.get("attempts", 0),
+            "queued_at": request.get("queued_at"),
+            "coordination_phase": "ALLOCATING",
+        }
+        self._redis_set_json(f"vehicle:{vehicle_id}:state", alloc_payload)
+        self._publish_event(
+            station_id=None,
+            vehicle_id=vehicle_id,
+            event_type="allocating",
+            message=f"Coordinator resolving slots for {vehicle_id} across the multi-station mesh.",
+        )
+        decision = self._choose_interval(
+            vehicle_id=vehicle_id,
+            priority=priority,
+            earliest=earliest,
+            duration=duration,
+            queue_size=queue_size,
+            preferred_station=int(request.get("preferred_station", 1)),
         )
         self._redis_set_json("coordinator:latest_decision", decision)
-        self._publish_event(
-            station_id=decision.get("selected_station"),
-            vehicle_id=vehicle_id,
-            event_type="coordinator_decision",
-            message=decision["reasoning"],
-        )
-        if not decision.get("allocation"):
+        allocation = decision.get("allocation")
+        if not allocation:
+            request["attempts"] = int(request.get("attempts", 0)) + 1
+            jitter = random.randint(0, 4)
+            wait_backoff = min(36, 7 + request["attempts"] * 4 + jitter)
+            request["next_retry_at"] = (now + timedelta(minutes=wait_backoff)).isoformat()
+            reason = decision.get("failure_reason", "no_fit")
+            request["last_failure"] = reason
+            evt, msg = self._failure_narrative(reason, vehicle_id, request["attempts"], request.get("preferred_station"))
+            evt_out = evt
+            if evt != "conflict_escalating" and request["attempts"] >= 2:
+                evt_out = "allocation_retry"
             self._redis_set_json(
                 f"vehicle:{vehicle_id}:state",
-                {"status": "Searching", "vehicle_id": vehicle_id, "soc": random.randint(18, 62), "priority": priority},
+                {
+                    "status": "Waiting",
+                    "vehicle_id": vehicle_id,
+                    "soc": request.get("soc"),
+                    "priority": priority,
+                    "queue_attempts": request["attempts"],
+                    "queued_at": request.get("queued_at"),
+                    "waiting_reason": reason,
+                    "coordination_phase": "CONFLICT",
+                },
             )
             self._publish_event(
                 station_id=None,
                 vehicle_id=vehicle_id,
-                event_type="queue_updated",
-                message=f"{vehicle_id} added to the search queue; no fit in the active horizon.",
+                event_type=evt_out,
+                message=msg,
             )
-            return
-        allocation = decision["allocation"]
+            return False
+        ok = self._commit_allocation(request, allocation, now)
+        if ok:
+            self._publish_event(
+                station_id=decision.get("selected_station"),
+                vehicle_id=vehicle_id,
+                event_type="coordinator_decision",
+                message=decision["reasoning"],
+            )
+        return ok
+
+    def _commit_allocation(self, request: dict[str, Any], allocation: dict[str, Any], now: datetime) -> bool:
+        vehicle_id = request["vehicle_id"]
+        priority = int(request["priority"])
+        preferred = int(request.get("preferred_station", allocation["station_id"]))
+        user_id = self._ensure_user(vehicle_id, priority)
         lock_key = (
             f"lock:{allocation['station_id']}:{allocation['charger_id']}:"
             f"{allocation['start'].replace(':', '').replace('+', '_')}"
         )
         if not self._redis_set(lock_key, vehicle_id, nx=True, ex=LOCK_TTL_SECONDS):
+            request["attempts"] = int(request.get("attempts", 0)) + 1
+            request["next_retry_at"] = (now + timedelta(minutes=6)).isoformat()
             self._publish_event(
                 station_id=allocation["station_id"],
                 vehicle_id=vehicle_id,
                 event_type="queue_updated",
-                message=f"{vehicle_id} queued because a temporary slot lock already exists.",
+                message=f"{vehicle_id} delayed; selected slot still lock-held.",
             )
-            return
+            return False
         reservation_id = self._insert_reservation(
             user_id=user_id,
             vehicle_id=vehicle_id,
@@ -571,37 +945,42 @@ class OrchestrationService:
         )
         if reservation_id is None:
             self._redis_delete(lock_key)
-            self._redis_set_json(
-                f"vehicle:{vehicle_id}:state",
-                {"status": "Searching", "vehicle_id": vehicle_id, "soc": random.randint(18, 62), "priority": priority},
-            )
+            request["attempts"] = int(request.get("attempts", 0)) + 1
+            request["next_retry_at"] = (now + timedelta(minutes=7)).isoformat()
             self._publish_event(
                 station_id=allocation["station_id"],
                 vehicle_id=vehicle_id,
-                event_type="queue_updated",
-                message=f"{vehicle_id} queued because the selected slot was already reserved.",
+                event_type="conflict_detected",
+                message=f"{vehicle_id} hit interval collision; retrying in next cycle.",
             )
-            return
-        logger.info(
-            "Reservation created: reservation_id=%s vehicle_id=%s station_id=%s charger_id=%s",
-            reservation_id,
-            vehicle_id,
-            allocation["station_id"],
-            allocation["charger_id"],
-        )
+            return False
         self._hydrate_from_postgres()
-        self._redis_set_json(
-            f"vehicle:{vehicle_id}:state",
-            {
-                "status": "Reserved",
-                "vehicle_id": vehicle_id,
-                "assigned_station": allocation["station_id"],
-                "assigned_charger": allocation["charger_id"],
-                "reservation_id": reservation_id,
-                "soc": random.randint(18, 62),
-                "priority": priority,
-            },
-        )
+        station_name = STATION_NAMES.get(allocation["station_id"], f"Station {allocation['station_id']}")
+        rerouted = preferred != allocation["station_id"]
+        vehicle_payload: dict[str, Any] = {
+            "status": "Reserved",
+            "vehicle_id": vehicle_id,
+            "assigned_station": allocation["station_id"],
+            "assigned_charger": allocation["charger_id"],
+            "reservation_id": reservation_id,
+            "soc": request.get("soc"),
+            "priority": priority,
+            "queue_attempts": request.get("attempts", 0),
+            "queued_at": request.get("queued_at"),
+        }
+        if rerouted:
+            vehicle_payload["coordination_phase"] = "REROUTING"
+        self._redis_set_json(f"vehicle:{vehicle_id}:state", vehicle_payload)
+        if rerouted:
+            self._publish_event(
+                station_id=allocation["station_id"],
+                vehicle_id=vehicle_id,
+                event_type="rerouting",
+                message=(
+                    f"Coordinator rerouted {vehicle_id} from preferred Station {preferred} to "
+                    f"{station_name} (charger {allocation['charger_id']}) due to congestion / fragmentation."
+                ),
+            )
         self._publish_event(
             station_id=allocation["station_id"],
             vehicle_id=vehicle_id,
@@ -614,36 +993,63 @@ class OrchestrationService:
             event_type="slot_reserved",
             message=f"Future interval locked for {vehicle_id}.",
         )
+        return True
 
-    def _choose_interval(self, vehicle_id: str, priority: int, earliest: datetime, duration: timedelta) -> dict[str, Any]:
+    def _choose_interval(
+        self,
+        vehicle_id: str,
+        priority: int,
+        earliest: datetime,
+        duration: timedelta,
+        queue_size: int = 0,
+        preferred_station: int = 1,
+    ) -> dict[str, Any]:
         candidate_stations = []
         best = None
+        failure_reason = "no_fit"
+        failure_message = ""
         for station_id, charger_count in STATION_LIMITS.items():
             intervals = self._read_station_timeline(station_id)
-            allocation = self._find_station_window(station_id, charger_count, intervals, earliest, duration)
+            allocation, station_meta = self._find_station_window(station_id, charger_count, intervals, earliest, duration)
             wait_minutes = (
                 int((datetime.fromisoformat(allocation["start"]) - earliest).total_seconds() / 60)
                 if allocation
                 else 999
             )
-            load = len([item for item in intervals if item["status"] in {"reserved", "charging"}])
-            score = wait_minutes + load * 4 - priority * 3
+            load = len(
+                [item for item in intervals if item["status"] in {"reserved", "charging", "waiting"}]
+            )
+            reroute_cost = abs(preferred_station - station_id) * 2
+            score = (
+                wait_minutes
+                + load * 3
+                + station_meta["fragmentation_score"] * 2
+                + min(16, queue_size // 2)
+                + reroute_cost
+                - priority * 4
+            )
             candidate = {
                 "station_id": station_id,
                 "station_name": STATION_NAMES[station_id],
                 "wait_minutes": wait_minutes,
                 "active_intervals": load,
+                "fragmentation_score": station_meta["fragmentation_score"],
+                "congestion_score": station_meta["congestion_score"],
+                "rejection_reason": station_meta["rejection_reason"],
                 "score": score,
                 "allocation": allocation,
             }
             candidate_stations.append(candidate)
             if allocation and (best is None or score < best["score"]):
                 best = candidate
+            if not allocation and station_meta["rejection_reason"]:
+                failure_reason = station_meta["rejection_reason"]
+                failure_message = station_meta["failure_message"]
         reasoning = (
-            f"{vehicle_id} assigned to {STATION_NAMES[best['station_id']]} because it has the lowest "
-            f"combined wait/load score ({best['score']})."
+            f"{vehicle_id} assigned to {STATION_NAMES[best['station_id']]} using lowest congestion/fragmentation score "
+            f"({best['score']}) with wait {best['wait_minutes']} min."
             if best
-            else f"{vehicle_id} remains searching because no reusable window fits the requested duration."
+            else f"{vehicle_id} remains queued: {failure_message or 'continuous charging interval unavailable.'}"
         )
         return {
             "vehicle_id": vehicle_id,
@@ -652,6 +1058,8 @@ class OrchestrationService:
             "selected_station": best["station_id"] if best else None,
             "allocation": best["allocation"] if best else None,
             "reasoning": reasoning,
+            "failure_reason": failure_reason,
+            "failure_message": failure_message,
             "decided_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -662,58 +1070,177 @@ class OrchestrationService:
         intervals: list[dict[str, Any]],
         earliest: datetime,
         duration: timedelta,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        free_windows = 0
+        fragmented_windows = 0
+        active_count = 0
+        horizon_end = earliest + timedelta(hours=HORIZON_HOURS)
+        for charger_id in range(1, charger_count + 1):
+            cursor = earliest
+            for offset in range(0, HORIZON_HOURS * 60, SEGMENT_MINUTES):
+                start = earliest + timedelta(minutes=offset)
+                end = start + timedelta(minutes=SEGMENT_MINUTES)
+                occupied = any(
+                    int(item["charger_id"]) == charger_id
+                    and datetime.fromisoformat(item["start"]) < end
+                    and datetime.fromisoformat(item["end"]) > start
+                    and item["status"] in {"reserved", "waiting", "charging"}
+                    for item in intervals
+                )
+                if occupied:
+                    active_count += 1
+                    if cursor < start:
+                        window = start - cursor
+                        free_windows += 1
+                        if window < duration:
+                            fragmented_windows += 1
+                    cursor = end
+            if cursor < horizon_end:
+                window = horizon_end - cursor
+                free_windows += 1
+                if window < duration:
+                    fragmented_windows += 1
         for offset in range(0, HORIZON_HOURS * 60, SEGMENT_MINUTES):
             start = earliest + timedelta(minutes=offset)
             end = start + duration
             if end > earliest + timedelta(hours=HORIZON_HOURS):
-                return None
+                break
             for charger_id in range(1, charger_count + 1):
                 has_conflict = any(
                     int(item["charger_id"]) == charger_id
                     and datetime.fromisoformat(item["start"]) < end
                     and datetime.fromisoformat(item["end"]) > start
-                    and item["status"] in {"reserved", "charging"}
+                    and item["status"] in {"reserved", "charging", "waiting"}
                     for item in intervals
                 )
                 if not has_conflict and not self._db_conflict(station_id, charger_id, start, end):
-                    return {
-                        "station_id": station_id,
-                        "charger_id": charger_id,
-                        "start": start.isoformat(),
-                        "end": end.isoformat(),
-                    }
-        return None
+                    return (
+                        {
+                            "station_id": station_id,
+                            "charger_id": charger_id,
+                            "start": start.isoformat(),
+                            "end": end.isoformat(),
+                        },
+                        {
+                            "fragmentation_score": fragmented_windows,
+                            "congestion_score": active_count,
+                            "rejection_reason": "",
+                            "failure_message": "",
+                        },
+                    )
+        rejection_reason = "station_saturation"
+        failure_message = f"Station {station_id} saturated; no uninterrupted window."
+        if free_windows and fragmented_windows >= max(1, free_windows // 2):
+            rejection_reason = "fragmentation_failure"
+            failure_message = "Free slots exist but no continuous charging interval is available."
+        return (
+            None,
+            {
+                "fragmentation_score": fragmented_windows,
+                "congestion_score": active_count,
+                "rejection_reason": rejection_reason,
+                "failure_message": failure_message,
+            },
+        )
 
     def _advance_lifecycles(self, now: datetime) -> None:
         rows = self._reservation_rows(now - timedelta(hours=2), now + timedelta(hours=HORIZON_HOURS))
         for row in rows:
             vehicle_id = row["vehicle_id"]
-            if row["reservation_start"] <= now < row["reservation_end"]:
-                if row["reservation_status"] != "charging":
-                    self._update_reservation_status(row["id"], "charging")
-                    self._start_session(row, now)
-                    self._redis_hset(f"station:{row['station_id']}:slots:live", str(row["charger_id"]), "charging")
-                    self._set_vehicle_status(vehicle_id, "Charging", row)
-                    logger.info(
-                        "Charging lifecycle transition: reservation_id=%s vehicle_id=%s status=charging",
-                        row["id"],
-                        vehicle_id,
-                    )
-                    self._publish_event(row["station_id"], vehicle_id, "charging_started", f"{vehicle_id} started charging.")
-            elif now >= row["reservation_end"] and row["reservation_status"] != "completed":
+            rs = str(row["reservation_status"]).lower()
+            if rs == "completed":
+                continue
+            st = row["reservation_start"]
+            en = row["reservation_end"]
+            plug_m, linger_m = self._vehicle_timing_jitter(vehicle_id)
+            plug_end = st + timedelta(minutes=plug_m)
+            eff_end = en + timedelta(minutes=linger_m)
+
+            if now >= eff_end and rs != "completed":
                 self._update_reservation_status(row["id"], "completed")
                 self._complete_session(row, now)
                 self._redis_hset(f"station:{row['station_id']}:slots:live", str(row["charger_id"]), "free")
-                self._set_vehicle_status(vehicle_id, "Completed", row)
+                dwell = timedelta(minutes=8 + random.randint(0, 6))
+                self._redis_set_json(
+                    f"vehicle:{vehicle_id}:state",
+                    {
+                        "status": "Completed",
+                        "vehicle_id": vehicle_id,
+                        "assigned_station": row["station_id"],
+                        "assigned_charger": row["charger_id"],
+                        "reservation_id": row["id"],
+                        "completed_until": (now + dwell).isoformat(),
+                    },
+                )
                 logger.info(
                     "Charging lifecycle transition: reservation_id=%s vehicle_id=%s status=completed",
                     row["id"],
                     vehicle_id,
                 )
-                self._publish_event(row["station_id"], vehicle_id, "charging_completed", f"{vehicle_id} completed charging.")
-                self._publish_event(row["station_id"], vehicle_id, "slot_released", f"Charger {row['charger_id']} released.")
-            elif row["reservation_start"] - timedelta(minutes=15) <= now < row["reservation_start"] and row["reservation_status"] != "waiting":
+                self._publish_event(
+                    row["station_id"],
+                    vehicle_id,
+                    "charging_completed",
+                    f"{vehicle_id} tapering charge complete after sustained session — bay releasing shortly.",
+                )
+                self._publish_event(
+                    row["station_id"],
+                    vehicle_id,
+                    "slot_released",
+                    f"Charger {row['charger_id']} released following session wrap-up.",
+                )
+                continue
+
+            if plug_end <= now < eff_end and rs != "charging":
+                self._update_reservation_status(row["id"], "charging")
+                self._start_session(row, now)
+                self._redis_hset(f"station:{row['station_id']}:slots:live", str(row["charger_id"]), "charging")
+                self._redis_set_json(
+                    f"vehicle:{vehicle_id}:state",
+                    {
+                        "status": "Charging",
+                        "vehicle_id": vehicle_id,
+                        "assigned_station": row["station_id"],
+                        "assigned_charger": row["charger_id"],
+                        "reservation_id": row["id"],
+                    },
+                )
+                logger.info(
+                    "Charging lifecycle transition: reservation_id=%s vehicle_id=%s status=charging",
+                    row["id"],
+                    vehicle_id,
+                )
+                self._publish_event(
+                    row["station_id"],
+                    vehicle_id,
+                    "charging_started",
+                    f"{vehicle_id} began power delivery after plug-in staging at Station {row['station_id']}.",
+                )
+                continue
+
+            if st <= now < plug_end:
+                if rs not in {"waiting"}:
+                    self._update_reservation_status(row["id"], "waiting")
+                    self._publish_event(
+                        row["station_id"],
+                        vehicle_id,
+                        "vehicle_waiting",
+                        f"{vehicle_id} staged at charger — plug-in handshake before energy transfer.",
+                    )
+                self._redis_set_json(
+                    f"vehicle:{vehicle_id}:state",
+                    {
+                        "status": "Waiting",
+                        "vehicle_id": vehicle_id,
+                        "assigned_station": row["station_id"],
+                        "assigned_charger": row["charger_id"],
+                        "reservation_id": row["id"],
+                        "waiting_reason": "plug_in_handshake",
+                    },
+                )
+                continue
+
+            if st - timedelta(minutes=15) <= now < st and rs == "reserved":
                 self._update_reservation_status(row["id"], "waiting")
                 self._set_vehicle_status(vehicle_id, "Waiting", row)
                 logger.info(
@@ -721,7 +1248,12 @@ class OrchestrationService:
                     row["id"],
                     vehicle_id,
                 )
-                self._publish_event(row["station_id"], vehicle_id, "vehicle_waiting", f"{vehicle_id} is waiting for its interval.")
+                self._publish_event(
+                    row["station_id"],
+                    vehicle_id,
+                    "vehicle_waiting",
+                    f"{vehicle_id} arriving within coordination pre-window for reserved interval.",
+                )
 
     def _ensure_user(self, vehicle_id: str, priority: int) -> int:
         payload = {
@@ -1196,10 +1728,10 @@ class OrchestrationService:
             for charger in station["chargers"]:
                 if charger["state"] == "charging":
                     active_sessions += 1
-                if charger["state"] == "reserved":
+                if charger["state"] in {"reserved", "waiting"}:
                     pending += 1
         metrics = {
-            "active_vehicles": len([v for v in vehicles if v.get("status") != "Completed"]),
+            "active_vehicles": len([v for v in vehicles if v.get("status") not in {"Completed", "Released"}]),
             "active_sessions": active_sessions,
             "pending_reservations": pending,
             "free_windows": free_windows,
@@ -1223,10 +1755,23 @@ class OrchestrationService:
 
     @staticmethod
     def _interval_status(row: dict[str, Any], now: datetime) -> str:
-        if str(row["reservation_status"]).lower() == "completed":
-            return "available"
-        if row["reservation_start"] <= now < row["reservation_end"]:
+        rs = str(row["reservation_status"]).lower()
+        if rs == "completed":
+            return "completed"
+        vid = str(row.get("vehicle_id") or "")
+        st = row["reservation_start"]
+        en = row["reservation_end"]
+        plug_m, linger_m = OrchestrationService._vehicle_timing_jitter(vid)
+        plug_end = st + timedelta(minutes=plug_m)
+        eff_end = en + timedelta(minutes=linger_m)
+        if now >= eff_end:
+            return "completed"
+        if plug_end <= now < eff_end:
             return "charging"
+        if st <= now < plug_end:
+            return "waiting"
+        if st - timedelta(minutes=15) <= now < st:
+            return "waiting"
         return "reserved"
 
     def _read_clock(self) -> SimulationClock:
@@ -1251,8 +1796,22 @@ class OrchestrationService:
     def _read_station_timeline(self, station_id: int) -> list[dict[str, Any]]:
         return self._redis_get_json(f"station:{station_id}:timeline") or []
 
+    def _read_pending_queue(self) -> list[dict[str, Any]]:
+        return self._redis_get_json(QUEUE_KEY) or []
+
+    def _write_pending_queue(self, queue: list[dict[str, Any]]) -> None:
+        self._redis_set_json(QUEUE_KEY, queue[:180])
+
     def _clear_runtime_keys(self) -> None:
-        for pattern in ("station:*:timeline", "station:*:slots:live", "vehicle:*:state", "lock:*", "events:stream", "sim:*", "coordinator:*"):
+        for pattern in (
+            "station:*:timeline",
+            "station:*:slots:live",
+            "vehicle:*:state",
+            "lock:*",
+            "events:stream",
+            "sim:*",
+            "coordinator:*",
+        ):
             for key in self._redis_keys(pattern):
                 self._redis_delete(key)
 
