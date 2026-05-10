@@ -1,13 +1,18 @@
+from __future__ import annotations
+
+import os
+
+
 POSTGRES_CONFIG = {
-    "dbname": "Long-term memory",
-    "user": "postgres",
-    "password": "vsk",
-    "host": "localhost",
-    "port": "5432"
+    "dbname": os.getenv("POSTGRES_DB", "Long-term memory"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", "vsk"),
+    "host": os.getenv("POSTGRES_HOST", "localhost"),
+    "port": os.getenv("POSTGRES_PORT", "5432"),
 }
 
 REDIS_CONFIG = {
-    "host": "localhost",
-    "port": 6379,
-    "db": 0
+    "host": os.getenv("REDIS_HOST", "localhost"),
+    "port": int(os.getenv("REDIS_PORT", "6379")),
+    "db": int(os.getenv("REDIS_DB", "0")),
 }

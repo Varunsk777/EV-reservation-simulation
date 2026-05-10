@@ -3,52 +3,37 @@ from __future__ import annotations
 from core.database import get_db_connection
 
 
-def register_vehicle(vehicle):
+def register_vehicle(vehicle: dict[str, object]) -> int | None:
+    vehicle_id = str(vehicle["vehicle_id"])
+    priority = int(vehicle.get("priority_level", 1))
     conn = get_db_connection()
-    cur = conn.cursor()
-
     try:
-        cur.execute(
-            """
-            SELECT vehicle_id
-            FROM core.vehicles
-            WHERE registration_number = %s
-            """,
-            (f"SIM-{vehicle['vehicle_id']}",),
-        )
-
-        existing = cur.fetchone()
-        if existing:
-            return existing[0]
-
-        cur.execute(
-            """
-            INSERT INTO core.vehicles (
-                user_id,
-                registration_number,
-                vehicle_type,
-                battery_capacity,
-                created_at
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM core.users WHERE vehicle_id = %s LIMIT 1;", (vehicle_id,))
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+            cur.execute(
+                """
+                INSERT INTO core.users (name, email, password_hash, username, vehicle_id, priority_level)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING user_id;
+                """,
+                (
+                    f"user-{vehicle_id}",
+                    f"{vehicle_id.lower()}@simulation.local",
+                    "simulation",
+                    f"user-{vehicle_id}",
+                    vehicle_id,
+                    priority,
+                ),
             )
-            VALUES (%s, %s, %s, %s, NOW())
-            RETURNING vehicle_id;
-            """,
-            (
-                1,
-                f"SIM-{vehicle['vehicle_id']}",
-                "car",
-                vehicle["battery_needed"],
-            ),
-        )
-
-        vehicle_id = cur.fetchone()[0]
+            user_id = int(cur.fetchone()[0])
+            cur.execute("UPDATE core.users SET id = user_id WHERE user_id = %s;", (user_id,))
         conn.commit()
-        return vehicle_id
-
-    except Exception as exc:
+        return user_id
+    except Exception:
         conn.rollback()
-        print("Vehicle registration error:", exc)
         return None
     finally:
-        cur.close()
         conn.close()

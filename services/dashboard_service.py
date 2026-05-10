@@ -7,17 +7,18 @@ from datetime import datetime
 
 from core.redis import redis_client
 from services.station_service import load_stations_into_redis, reset_station_cache, snapshot_stations
+from redis.exceptions import RedisError
 
 
 @dataclass
 class FeedItem:
-    vehicle_id: int
     station_id: int
-    start_time: str
-    end_time: str
     success: bool
     message: str
+    status: str
     slot_id: int | None
+    point_id: int | None
+    slot_time: str | None
     timestamp: str
 
 
@@ -58,14 +59,15 @@ class DashboardState:
     def record_request(
         self,
         *,
-        vehicle_id: int,
         station_id: int,
-        start_time: str,
-        end_time: str,
         success: bool,
         message: str,
+        status: str | None = None,
         slot_id: int | None,
+        point_id: int | None = None,
+        slot_time: str | None = None,
     ) -> None:
+        status = status or ("OCCUPIED" if success else "NO_AVAILABILITY")
         with self._lock:
             self._stats["totalRequests"] += 1
             if success:
@@ -75,13 +77,13 @@ class DashboardState:
 
             self._requests.appendleft(
                 FeedItem(
-                    vehicle_id=vehicle_id,
                     station_id=station_id,
-                    start_time=start_time,
-                    end_time=end_time,
                     success=success,
                     message=message,
+                    status=status,
                     slot_id=slot_id,
+                    point_id=point_id or slot_id,
+                    slot_time=slot_time,
                     timestamp=datetime.now().isoformat(),
                 )
             )
@@ -94,12 +96,45 @@ class DashboardState:
         with self._lock:
             return self._simulation_running
 
+    def activity_snapshot(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                {
+                    "type": "SIMULATION",
+                    "station_id": item.station_id,
+                    "point_id": item.point_id,
+                    "slot_time": item.slot_time,
+                    "status": item.status,
+                    "timestamp": item.timestamp,
+                    "message": item.message,
+                }
+                for item in self._requests
+            ]
+
+    def runtime_stats(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._stats)
+
     def snapshot(self) -> dict[str, object]:
+        from services.observability_service import get_metrics
+
         with self._lock:
             requests = [item.__dict__ for item in self._requests]
             logs = [item.__dict__ for item in self._logs]
             stats = dict(self._stats)
             simulation_running = self._simulation_running
+
+        try:
+            redis_connected = bool(redis_client.ping())
+        except RedisError:
+            redis_connected = False
+
+        metrics = get_metrics()
+        stats["totalRequests"] = metrics["total_requests"]
+        stats["success"] = metrics["success"]
+        stats["failed"] = metrics["failed"]
+        stats["avgWaitTime"] = metrics["avg_wait_time"]
+        stats["utilization"] = metrics["utilization"]
 
         return {
             "stations": snapshot_stations(),
@@ -108,7 +143,7 @@ class DashboardState:
             "stats": stats,
             "simulation": {
                 "running": simulation_running,
-                "redis_connected": bool(redis_client.ping()),
+                "redis_connected": redis_connected,
             },
         }
 

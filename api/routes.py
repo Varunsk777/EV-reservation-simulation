@@ -1,77 +1,76 @@
 from __future__ import annotations
 
-import logging
-import threading
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 
-from fastapi import APIRouter, status
-
-from models.schemas import (
-    ReservationRequest,
-    ReservationResponse,
-    SimulationStartRequest,
-    SimulationStartResponse,
-)
-from services.coordinator import reserve_slot
-from services.dashboard_service import dashboard_state
-from services.station_service import load_stations_into_redis, reset_station_cache
-from simulation.simulator import run_simulation
+from services.orchestration_service import orchestration_service
 
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["dashboard"])
+class SimulationControlRequest(BaseModel):
+    speed: int | None = Field(default=None, ge=1, le=20)
 
 
-@router.post(
-    "/reserve",
-    response_model=ReservationResponse,
-    status_code=status.HTTP_200_OK,
-)
-def create_reservation_route(payload: ReservationRequest) -> ReservationResponse:
-    result = reserve_slot(
-        vehicle_id=payload.vehicle_id,
-        station_id=payload.station_id,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
-    )
-    return ReservationResponse(**result)
+api_router = APIRouter(prefix="/api", tags=["orchestration"])
+router = APIRouter(tags=["compatibility"])
 
 
-@router.get("/dashboard")
-def get_dashboard() -> dict[str, object]:
-    return dashboard_state.snapshot()
+@api_router.get("/dashboard")
+def dashboard() -> dict[str, object]:
+    return orchestration_service.snapshot()
 
 
-def _run_simulation_job(iterations: int) -> None:
+@api_router.post("/simulation/start")
+def start_simulation(payload: SimulationControlRequest) -> dict[str, object]:
+    started = orchestration_service.start(speed=payload.speed)
+    return {
+        "started": started,
+        "running": orchestration_service.is_running(),
+        "message": "Simulation running" if started else "Simulation resumed",
+    }
+
+
+@api_router.post("/simulation/pause")
+def pause_simulation() -> dict[str, object]:
+    orchestration_service.pause()
+    return {"paused": True}
+
+
+@api_router.post("/simulation/resume")
+def resume_simulation() -> dict[str, object]:
+    orchestration_service.resume()
+    return {"running": True}
+
+
+@api_router.post("/simulation/speed")
+def set_simulation_speed(payload: SimulationControlRequest) -> dict[str, object]:
+    if payload.speed is not None:
+        orchestration_service.set_speed(payload.speed)
+    return {"clock": orchestration_service.snapshot()["clock"]}
+
+
+@api_router.post("/simulation/reset")
+def reset_simulation() -> dict[str, object]:
+    orchestration_service.reset()
+    return {"reset": True, "payload": orchestration_service.snapshot()}
+
+
+@api_router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await orchestration_service.register_websocket(websocket)
     try:
-        dashboard_state.reset_run()
-        reset_station_cache()
-        load_stations_into_redis()
-        run_simulation(iterations=iterations, dashboard_state=dashboard_state)
-    finally:
-        dashboard_state.set_running(False)
-
-
-@router.post(
-    "/simulation/start",
-    response_model=SimulationStartResponse,
-    status_code=status.HTTP_200_OK,
-)
-def start_simulation(payload: SimulationStartRequest) -> SimulationStartResponse:
-    if dashboard_state.is_running():
-        return SimulationStartResponse(
-            started=False,
-            message="Simulation is already running.",
-        )
-
-    dashboard_state.set_running(True)
-    worker = threading.Thread(
-        target=_run_simulation_job,
-        args=(payload.iterations,),
-        daemon=True,
-    )
-    worker.start()
-
-    return SimulationStartResponse(
-        started=True,
-        message=f"Simulation started with {payload.iterations} iterations.",
-    )
+        while True:
+            message = await websocket.receive_json()
+            action = message.get("action")
+            if action == "start":
+                orchestration_service.start(speed=message.get("speed"))
+            elif action == "pause":
+                orchestration_service.pause()
+            elif action == "resume":
+                orchestration_service.resume()
+            elif action == "reset":
+                orchestration_service.reset()
+            elif action == "speed":
+                orchestration_service.set_speed(int(message.get("speed", 2)))
+    except WebSocketDisconnect:
+        orchestration_service.unregister_websocket(websocket)

@@ -1,249 +1,275 @@
-const POLL_INTERVAL_MS = 1000;
-const DASHBOARD_ENDPOINTS = ["/api/dashboard"];
-const START_SIMULATION_ENDPOINT = "/api/simulation/start";
+const lifecycleStates = ["Searching", "Reserved", "Waiting", "Charging", "Completed"];
 
 const state = {
-  endpoint: null,
-  payloadHash: "",
+  socket: null,
+  payload: null,
+  connected: false,
 };
 
 const els = {
-  stationsGrid: document.getElementById("stations-grid"),
-  requestsFeed: document.getElementById("requests-feed"),
-  logsList: document.getElementById("logs-list"),
-  stationCount: document.getElementById("station-count"),
-  statTotal: document.getElementById("stat-total"),
-  statSuccess: document.getElementById("stat-success"),
-  statFailed: document.getElementById("stat-failed"),
-  connectionStatus: document.getElementById("connection-status"),
-  lastUpdated: document.getElementById("last-updated"),
-  startButton: document.getElementById("start-simulation-button"),
-  iterationsInput: document.getElementById("iterations-input"),
-  stationTemplate: document.getElementById("station-card-template"),
-  feedTemplate: document.getElementById("feed-item-template"),
-  logTemplate: document.getElementById("log-item-template"),
+  simTime: document.getElementById("sim-time"),
+  activeVehicles: document.getElementById("active-vehicles"),
+  activeSessions: document.getElementById("active-sessions"),
+  pendingReservations: document.getElementById("pending-reservations"),
+  freeWindows: document.getElementById("free-windows"),
+  playPause: document.getElementById("play-pause"),
+  speedSelect: document.getElementById("speed-select"),
+  resetSim: document.getElementById("reset-sim"),
+  stationTimelines: document.getElementById("station-timelines"),
+  decisionBody: document.getElementById("decision-body"),
+  lifecycleColumns: document.getElementById("lifecycle-columns"),
+  eventStream: document.getElementById("event-stream"),
+  connectionState: document.getElementById("connection-state"),
 };
 
-async function fetchDashboardData() {
-  const endpoints = state.endpoint ? [state.endpoint] : DASHBOARD_ENDPOINTS;
-
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint, { cache: "no-store" });
-      if (!response.ok) {
-        continue;
-      }
-
-      const payload = await response.json();
-      state.endpoint = endpoint;
-      return payload;
-    } catch (error) {
-      continue;
-    }
-  }
-
-  throw new Error("Unable to reach dashboard endpoint.");
-}
-
-function normalizePayload(payload) {
-  return {
-    stations: Array.isArray(payload.stations) ? payload.stations : [],
-    requests: Array.isArray(payload.requests) ? payload.requests : [],
-    logs: Array.isArray(payload.logs) ? payload.logs : [],
-    stats: {
-      totalRequests: payload.stats?.totalRequests ?? 0,
-      success: payload.stats?.success ?? 0,
-      failed: payload.stats?.failed ?? 0,
-    },
-    simulation: {
-      running: Boolean(payload.simulation?.running),
-    },
-  };
-}
-
-function formatTime(value) {
-  if (!value) {
-    return "--";
-  }
-
+function fmtTime(value) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
+  if (Number.isNaN(date.getTime())) return "--:--";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
 
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
+function fmtWindow(start, end) {
+  return `${fmtTime(start)}-${fmtTime(end)}`;
+}
+
+function setConnection(connected) {
+  state.connected = connected;
+  els.connectionState.textContent = connected ? "Realtime" : "Polling";
+  els.connectionState.classList.toggle("connected", connected);
+}
+
+async function getDashboard() {
+  const response = await fetch("/api/dashboard", { cache: "no-store" });
+  if (!response.ok) throw new Error("Dashboard unavailable");
+  return response.json();
+}
+
+async function postJson(url, payload = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
+  if (!response.ok) throw new Error(`${url} failed`);
+  return response.json();
 }
 
-function setConnectionStatus(statusText, connected) {
-  els.connectionStatus.textContent = statusText;
-  els.connectionStatus.parentElement.style.borderColor = connected
-    ? "rgba(56, 189, 248, 0.16)"
-    : "rgba(239, 68, 68, 0.24)";
-  els.connectionStatus.previousElementSibling.style.background = connected ? "#38bdf8" : "#ef4444";
-  els.connectionStatus.previousElementSibling.style.boxShadow = connected
-    ? "0 0 0 6px rgba(56, 189, 248, 0.15)"
-    : "0 0 0 6px rgba(239, 68, 68, 0.15)";
+function render(payload) {
+  state.payload = payload;
+  renderControls(payload.clock || {});
+  renderMetrics(payload.metrics || {});
+  renderStations(payload.stations || []);
+  renderDecision(payload.decision || {});
+  renderLifecycle(payload.vehicles || []);
+  renderEvents(payload.events || []);
 }
 
-function renderEmptyState(message) {
-  const empty = document.createElement("div");
-  empty.className = "empty-state";
-  empty.textContent = message;
-  return empty;
+function renderControls(clock) {
+  els.simTime.textContent = fmtTime(clock.current_time);
+  els.playPause.textContent = clock.paused || !clock.running ? "Play" : "Pause";
+  if (clock.speed) els.speedSelect.value = String(clock.speed);
+}
+
+function renderMetrics(metrics) {
+  els.activeVehicles.textContent = metrics.active_vehicles || 0;
+  els.activeSessions.textContent = metrics.active_sessions || 0;
+  els.pendingReservations.textContent = metrics.pending_reservations || 0;
+  els.freeWindows.textContent = metrics.free_windows || 0;
 }
 
 function renderStations(stations) {
-  const fragment = document.createDocumentFragment();
-
   if (!stations.length) {
-    fragment.appendChild(renderEmptyState("No station data available yet."));
+    els.stationTimelines.innerHTML = `<div class="empty-state">No station timeline state available.</div>`;
+    return;
   }
 
-  for (const station of stations) {
-    const node = els.stationTemplate.content.firstElementChild.cloneNode(true);
-    const slotBadges = node.querySelector(".slot-badges");
-    const stationId = station.station_id ?? "--";
-    const slots = Array.isArray(station.slots) ? station.slots : [];
-    const availableCount = slots.filter((slot) => String(slot.status).toLowerCase() === "available").length;
+  els.stationTimelines.replaceChildren(...stations.map(renderStation));
+}
 
-    node.querySelector(".station-title").textContent = `Station ${stationId}`;
-    node.querySelector(".station-summary").textContent = `${availableCount}/${slots.length} available`;
+function renderStation(station) {
+  const details = document.createElement("details");
+  details.className = "station-panel";
+  details.open = true;
 
-    if (!slots.length) {
-      slotBadges.appendChild(renderEmptyState("No slots"));
+  const summary = document.createElement("summary");
+  const busyCount = station.chargers.filter((charger) => charger.state !== "free").length;
+  summary.innerHTML = `
+    <div>
+      <span class="station-overline">${station.location || "Coordination zone"}</span>
+      <strong>${station.station_name}</strong>
+    </div>
+    <span>${busyCount}/${station.charger_count} active</span>
+  `;
+  details.appendChild(summary);
+
+  const axis = document.createElement("div");
+  axis.className = "time-axis";
+  axis.appendChild(document.createElement("span"));
+  for (const tick of station.time_axis || []) {
+    const label = document.createElement("span");
+    label.textContent = fmtTime(tick);
+    axis.appendChild(label);
+  }
+  details.appendChild(axis);
+
+  const rows = document.createElement("div");
+  rows.className = "charger-rows";
+  for (const charger of station.chargers || []) {
+    rows.appendChild(renderChargerRow(charger));
+  }
+  details.appendChild(rows);
+
+  const windows = document.createElement("div");
+  windows.className = "free-window-strip";
+  const freeWindows = station.free_windows || [];
+  windows.append(
+    ...freeWindows.slice(0, 6).map((window) => {
+      const pill = document.createElement("span");
+      pill.textContent = `C${window.charger_id} ${fmtWindow(window.start, window.end)}`;
+      return pill;
+    }),
+  );
+  if (!freeWindows.length) {
+    const pill = document.createElement("span");
+    pill.textContent = "No reusable window in horizon";
+    windows.appendChild(pill);
+  }
+  details.appendChild(windows);
+  return details;
+}
+
+function renderChargerRow(charger) {
+  const row = document.createElement("div");
+  row.className = "charger-row";
+
+  const label = document.createElement("div");
+  label.className = "charger-label";
+  label.innerHTML = `<strong>C${charger.charger_id}</strong><span>${charger.state}</span>`;
+  row.appendChild(label);
+
+  const track = document.createElement("div");
+  track.className = "timeline-track";
+  for (const segment of charger.segments || []) {
+    const block = document.createElement("span");
+    block.className = `segment ${segment.status}`;
+    block.title = `${fmtWindow(segment.start, segment.end)} ${segment.status}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
+    track.appendChild(block);
+  }
+  row.appendChild(track);
+  return row;
+}
+
+function renderDecision(decision) {
+  const candidates = decision.candidate_stations || [];
+  const selected = decision.selected_station;
+  const rows = candidates.map((candidate) => `
+    <div class="candidate-row ${candidate.station_id === selected ? "selected" : ""}">
+      <span>${candidate.station_name}</span>
+      <strong>${candidate.wait_minutes >= 999 ? "No fit" : `${candidate.wait_minutes} min`}</strong>
+      <em>score ${candidate.score}</em>
+    </div>
+  `).join("");
+
+  els.decisionBody.innerHTML = `
+    <div class="decision-summary">
+      <span>Final Allocation</span>
+      <strong>${selected ? `Station ${selected}` : "Pending"}</strong>
+    </div>
+    <div class="candidate-list">${rows || `<div class="empty-state">Waiting for candidate analysis.</div>`}</div>
+    <p class="reasoning">${decision.reasoning || "Waiting for the next coordinator decision."}</p>
+  `;
+}
+
+function renderLifecycle(vehicles) {
+  els.lifecycleColumns.replaceChildren(...lifecycleStates.map((status) => {
+    const column = document.createElement("div");
+    column.className = "lifecycle-column";
+    const items = vehicles.filter((vehicle) => vehicle.status === status).slice(0, 8);
+    column.innerHTML = `<h3>${status}<span>${items.length}</span></h3>`;
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "mini-empty";
+      empty.textContent = "None";
+      column.appendChild(empty);
+      return column;
     }
-
-    for (const slot of slots) {
-      const badge = document.createElement("span");
-      const status = String(slot.status ?? "pending").toLowerCase();
-      const slotId = slot.slot_id ?? "--";
-
-      badge.className = `slot-badge ${status === "available" ? "available" : status === "occupied" ? "occupied" : "pending"}`;
-      badge.textContent = `Slot ${slotId} - ${status}`;
-      slotBadges.appendChild(badge);
+    for (const vehicle of items) {
+      const card = document.createElement("div");
+      card.className = "vehicle-chip";
+      card.innerHTML = `
+        <strong>${vehicle.vehicle_id}</strong>
+        <span>${vehicle.assigned_station ? `S${vehicle.assigned_station} C${vehicle.assigned_charger}` : `SOC ${vehicle.soc || "--"}%`}</span>
+      `;
+      column.appendChild(card);
     }
-
-    fragment.appendChild(node);
-  }
-
-  els.stationsGrid.replaceChildren(fragment);
-  els.stationCount.textContent = `${stations.length} Station${stations.length === 1 ? "" : "s"}`;
+    return column;
+  }));
 }
 
-function renderRequests(requests) {
-  const fragment = document.createDocumentFragment();
-
-  if (!requests.length) {
-    fragment.appendChild(renderEmptyState("No live requests yet."));
+function renderEvents(events) {
+  if (!events.length) {
+    els.eventStream.innerHTML = `<div class="empty-state">No operational events yet.</div>`;
+    return;
   }
-
-  for (const request of requests) {
-    const node = els.feedTemplate.content.firstElementChild.cloneNode(true);
-    const statusNode = node.querySelector(".feed-status");
-    const statusLabel = request.success ? "SUCCESS" : "FAILED";
-
-    node.querySelector(".feed-main").textContent =
-      `Vehicle ${request.vehicle_id} -> Station ${request.station_id} -> ${statusLabel}`;
-    statusNode.textContent = statusLabel;
-    statusNode.classList.add(request.success ? "success" : "failure");
-    fragment.appendChild(node);
-  }
-
-  els.requestsFeed.replaceChildren(fragment);
+  els.eventStream.replaceChildren(...events.slice(0, 50).map((event) => {
+    const row = document.createElement("div");
+    row.className = "event-row";
+    row.innerHTML = `
+      <time>${fmtTime(event.timestamp)}</time>
+      <div>
+        <strong>${String(event.event_type || "").replaceAll("_", " ")}</strong>
+        <p>${event.message || event.event_message || ""}</p>
+      </div>
+    `;
+    return row;
+  }));
 }
 
-function renderLogs(logs) {
-  const fragment = document.createDocumentFragment();
+function connectWebSocket() {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocol}://${window.location.host}/api/ws`);
+  state.socket = socket;
 
-  if (!logs.length) {
-    fragment.appendChild(renderEmptyState("No logs available."));
-  }
-
-  for (const entry of logs) {
-    const node = els.logTemplate.content.firstElementChild.cloneNode(true);
-    node.querySelector(".log-time").textContent = formatTime(entry.timestamp);
-    node.querySelector(".log-message").textContent = entry.message;
-    fragment.appendChild(node);
-  }
-
-  els.logsList.replaceChildren(fragment);
+  socket.addEventListener("open", () => setConnection(true));
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "snapshot") render(message.payload);
+  });
+  socket.addEventListener("close", () => {
+    setConnection(false);
+    setTimeout(connectWebSocket, 2500);
+  });
+  socket.addEventListener("error", () => setConnection(false));
 }
 
-function renderStats(stats) {
-  els.statTotal.textContent = stats.totalRequests;
-  els.statSuccess.textContent = stats.success;
-  els.statFailed.textContent = stats.failed;
-}
-
-function renderDashboard(payload) {
-  const normalized = normalizePayload(payload);
-  renderStations(normalized.stations);
-  renderRequests(normalized.requests);
-  renderLogs(normalized.logs);
-  renderStats(normalized.stats);
-  els.startButton.disabled = normalized.simulation.running;
-  els.startButton.textContent = normalized.simulation.running ? "Simulation Running" : "Start Simulation";
-  els.lastUpdated.textContent = `Last updated ${new Date().toLocaleTimeString()}`;
-}
-
-async function refreshDashboard() {
+async function refreshFallback() {
+  if (state.connected) return;
   try {
-    const payload = await fetchDashboardData();
-    const nextHash = JSON.stringify(payload);
-
-    if (nextHash !== state.payloadHash) {
-      renderDashboard(payload);
-      state.payloadHash = nextHash;
-    } else {
-      els.lastUpdated.textContent = `Last checked ${new Date().toLocaleTimeString()}`;
-    }
-
-    setConnectionStatus("Live", true);
+    render(await getDashboard());
   } catch (error) {
-    if (!state.payloadHash) {
-      els.stationsGrid.replaceChildren(renderEmptyState("Waiting for dashboard data..."));
-      els.requestsFeed.replaceChildren(renderEmptyState("Feed unavailable."));
-      els.logsList.replaceChildren(renderEmptyState("Logs unavailable."));
-    }
-
-    setConnectionStatus("Disconnected", false);
-    els.lastUpdated.textContent = "Retrying connection...";
+    els.connectionState.textContent = "Offline";
   }
 }
 
-async function startSimulation() {
-  const iterations = Number(els.iterationsInput.value || 12);
-  els.startButton.disabled = true;
-  els.startButton.textContent = "Starting...";
-
-  try {
-    const response = await fetch(START_SIMULATION_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ iterations }),
-    });
-
-    const payload = await response.json();
-    if (!response.ok || !payload.started) {
-      throw new Error(payload.message || "Unable to start simulation.");
-    }
-
-    els.lastUpdated.textContent = payload.message;
-    await refreshDashboard();
-  } catch (error) {
-    els.startButton.disabled = false;
-    els.startButton.textContent = "Start Simulation";
-    els.lastUpdated.textContent = error.message;
+els.playPause.addEventListener("click", async () => {
+  const clock = state.payload?.clock || {};
+  if (clock.paused || !clock.running) {
+    await postJson("/api/simulation/start", { speed: Number(els.speedSelect.value) });
+  } else {
+    await postJson("/api/simulation/pause");
   }
-}
+  render(await getDashboard());
+});
 
-els.startButton.addEventListener("click", startSimulation);
+els.speedSelect.addEventListener("change", async () => {
+  await postJson("/api/simulation/speed", { speed: Number(els.speedSelect.value) });
+});
 
-refreshDashboard();
-setInterval(refreshDashboard, POLL_INTERVAL_MS);
+els.resetSim.addEventListener("click", async () => {
+  await postJson("/api/simulation/reset");
+  render(await getDashboard());
+});
+
+connectWebSocket();
+refreshFallback();
+setInterval(refreshFallback, 1500);

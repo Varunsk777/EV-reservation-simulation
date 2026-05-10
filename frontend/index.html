@@ -3,113 +3,93 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EV Charging Coordinator Dashboard</title>
+  <title>EV Coordination Control Center</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=20260509">
 </head>
 <body>
   <div class="app-shell">
-    <header class="page-header surface">
-      <div>
-        <p class="eyebrow">Realtime Simulation Monitor</p>
-        <h1>EV Charging Coordinator Dashboard</h1>
+    <header class="control-bar">
+      <div class="brand-block">
+        <span class="system-kicker">Distributed Charging Orchestrator</span>
+        <h1>EV Coordination Control Center</h1>
       </div>
-      <div class="header-meta">
-        <div class="simulation-controls">
-          <label class="iterations-control">
-            <span>Iterations</span>
-            <input id="iterations-input" type="number" min="1" max="200" value="12">
-          </label>
-          <button id="start-simulation-button" class="start-button" type="button">Start Simulation</button>
-        </div>
-        <div class="live-indicator">
-          <span class="live-dot"></span>
-          <span id="connection-status">Connecting</span>
-        </div>
-        <p id="last-updated" class="meta-copy">Waiting for first update</p>
+      <div class="metric-strip">
+        <div class="metric"><span>Simulation Time</span><strong id="sim-time">--:--</strong></div>
+        <div class="metric"><span>Active Vehicles</span><strong id="active-vehicles">0</strong></div>
+        <div class="metric"><span>Active Sessions</span><strong id="active-sessions">0</strong></div>
+        <div class="metric"><span>Pending Reservations</span><strong id="pending-reservations">0</strong></div>
+        <div class="metric"><span>Free Windows</span><strong id="free-windows">0</strong></div>
+      </div>
+      <div class="control-actions">
+        <button id="play-pause" class="primary-button" type="button">Play</button>
+        <label class="speed-control">
+          <span>Speed</span>
+          <select id="speed-select">
+            <option value="1">1x</option>
+            <option value="2" selected>2x</option>
+            <option value="5">5x</option>
+            <option value="10">10x</option>
+          </select>
+        </label>
+        <button id="reset-sim" class="ghost-button" type="button">Reset</button>
       </div>
     </header>
 
-    <section class="stats-grid">
-      <article class="stat-card surface">
-        <p class="stat-label">Total Requests</p>
-        <h2 id="stat-total" class="stat-value">0</h2>
-      </article>
-      <article class="stat-card surface">
-        <p class="stat-label">Success</p>
-        <h2 id="stat-success" class="stat-value success-text">0</h2>
-      </article>
-      <article class="stat-card surface">
-        <p class="stat-label">Failed</p>
-        <h2 id="stat-failed" class="stat-value failure-text">0</h2>
-      </article>
-    </section>
-
     <main class="main-grid">
-      <section class="surface panel">
+      <section class="panel scheduling-panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Station Overview</p>
-            <h3>Charging Stations</h3>
+            <span class="section-label">Station Scheduling View</span>
+            <h2>Three-Hour Interval Allocation</h2>
           </div>
-          <span id="station-count" class="panel-chip">0 Stations</span>
+          <div class="legend">
+            <span class="legend-item charging">Charging</span>
+            <span class="legend-item reserved">Reserved</span>
+            <span class="legend-item available">Available</span>
+            <span class="legend-item fault">Fault</span>
+          </div>
         </div>
-        <div id="stations-grid" class="stations-grid"></div>
+        <div id="station-timelines" class="station-timelines"></div>
       </section>
 
-      <section class="surface panel">
-        <div class="panel-head">
+      <aside class="panel decision-panel">
+        <div class="panel-head compact">
           <div>
-            <p class="eyebrow">Activity Stream</p>
-            <h3>Live Requests Feed</h3>
+            <span class="section-label">Coordinator Intelligence</span>
+            <h2>Decision Panel</h2>
           </div>
-          <span class="panel-chip">1s refresh</span>
+          <span id="connection-state" class="connection-pill">Connecting</span>
         </div>
-        <div id="requests-feed" class="feed-list"></div>
-      </section>
+        <div id="decision-body" class="decision-body"></div>
+      </aside>
     </main>
 
-    <section class="surface panel logs-panel">
-      <div class="panel-head">
-        <div>
-          <p class="eyebrow">System Trace</p>
-          <h3>Logs</h3>
+    <section class="bottom-grid">
+      <section class="panel lifecycle-panel">
+        <div class="panel-head compact">
+          <div>
+            <span class="section-label">Vehicle Lifecycle</span>
+            <h2>Runtime State</h2>
+          </div>
         </div>
-        <span class="panel-chip">Latest events</span>
-      </div>
-      <div id="logs-list" class="logs-list"></div>
+        <div id="lifecycle-columns" class="lifecycle-columns"></div>
+      </section>
+
+      <section class="panel event-panel">
+        <div class="panel-head compact">
+          <div>
+            <span class="section-label">Redis Stream</span>
+            <h2>Event Feed</h2>
+          </div>
+        </div>
+        <div id="event-stream" class="event-stream"></div>
+      </section>
     </section>
   </div>
 
-  <template id="station-card-template">
-    <article class="station-card">
-      <div class="station-header">
-        <div>
-          <p class="station-label">Station</p>
-          <h4 class="station-title"></h4>
-        </div>
-        <span class="station-summary"></span>
-      </div>
-      <div class="slot-badges"></div>
-    </article>
-  </template>
-
-  <template id="feed-item-template">
-    <article class="feed-item">
-      <div class="feed-main"></div>
-      <span class="feed-status"></span>
-    </article>
-  </template>
-
-  <template id="log-item-template">
-    <article class="log-item">
-      <span class="log-time"></span>
-      <p class="log-message"></p>
-    </article>
-  </template>
-
-  <script src="/static/script.js"></script>
+  <script src="/static/script.js?v=20260509"></script>
 </body>
 </html>
