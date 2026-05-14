@@ -17,6 +17,7 @@ const els = {
   activeSessions: document.getElementById("active-sessions"),
   pendingReservations: document.getElementById("pending-reservations"),
   freeWindows: document.getElementById("free-windows"),
+  adaptiveReallocations: document.getElementById("adaptive-reallocations"),
   playPause: document.getElementById("play-pause"),
   speedSelect: document.getElementById("speed-select"),
   resetSim: document.getElementById("reset-sim"),
@@ -64,7 +65,7 @@ function render(payload) {
   renderControls(payload.clock || {});
   renderMetrics(payload.metrics || {});
   renderStations(payload.stations || []);
-  renderDecision(payload.decision || {});
+  renderDecision(payload.decision || {}, payload.adaptive_recommendations || []);
   renderLifecycle(payload.vehicles || []);
   renderEvents(payload.events || []);
 }
@@ -82,6 +83,7 @@ function renderMetrics(metrics) {
   els.activeSessions.textContent = metrics.active_sessions || 0;
   els.pendingReservations.textContent = metrics.pending_reservations || 0;
   els.freeWindows.textContent = metrics.free_windows || 0;
+  els.adaptiveReallocations.textContent = metrics.adaptive_reallocations || 0;
 }
 
 function renderStations(stations) {
@@ -125,12 +127,13 @@ function renderStation(station, simNowMs) {
 
   const rows = document.createElement("div");
   rows.className = "charger-rows";
+  const { startMs, endMs } = getStationTimeBounds(station);
   for (const charger of station.chargers || []) {
-    rows.appendChild(renderChargerRow(charger, simNowMs));
+    const overlays = (station.adaptive_overlays || []).filter((item) => Number(item.charger_id) === Number(charger.charger_id));
+    rows.appendChild(renderChargerRow(charger, simNowMs, overlays, startMs, endMs));
   }
   timeline.appendChild(rows);
 
-  const { startMs, endMs } = getStationTimeBounds(station);
   const cursor = document.createElement("div");
   cursor.className = "current-time-cursor";
   cursor.dataset.startMs = String(startMs);
@@ -157,7 +160,7 @@ function renderStation(station, simNowMs) {
   return details;
 }
 
-function renderChargerRow(charger, simNowMs) {
+function renderChargerRow(charger, simNowMs, overlays = [], boundsStartMs = 0, boundsEndMs = 1) {
   const row = document.createElement("div");
   row.className = "charger-row";
 
@@ -181,11 +184,24 @@ function renderChargerRow(charger, simNowMs) {
     block.title = `${fmtWindow(segment.start, segment.end)} ${segment.status}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
     track.appendChild(block);
   }
+  for (const overlay of overlays) {
+    const marker = document.createElement("span");
+    const startMs = Date.parse(overlay.start);
+    const endMs = Date.parse(overlay.end);
+    const total = Math.max(1, boundsEndMs - boundsStartMs);
+    const left = Math.max(0, Math.min(100, ((startMs - boundsStartMs) / total) * 100));
+    const right = Math.max(0, Math.min(100, ((endMs - boundsStartMs) / total) * 100));
+    marker.className = `adaptive-overlay ${overlay.type === "requested" ? "requested" : "suggested"}`;
+    marker.style.left = `${left}%`;
+    marker.style.width = `${Math.max(3, right - left)}%`;
+    marker.title = `${overlay.type === "requested" ? "Requested overlap" : "Suggested window"} ${fmtWindow(overlay.start, overlay.end)}`;
+    track.appendChild(marker);
+  }
   row.appendChild(track);
   return row;
 }
 
-function renderDecision(decision) {
+function renderDecision(decision, recommendations = []) {
   const candidates = decision.candidate_stations || [];
   const selected = decision.selected_station;
   const rows = candidates.map((candidate) => `
@@ -196,13 +212,38 @@ function renderDecision(decision) {
     </div>
   `).join("");
 
+  const recommendationCards = recommendations.slice(0, 3).map(renderRecommendationCard).join("");
   els.decisionBody.innerHTML = `
     <div class="decision-summary">
       <span>Final Allocation</span>
       <strong>${selected ? `Station ${selected}` : "Pending"}</strong>
     </div>
+    ${recommendationCards ? `<div class="recommendation-stack">${recommendationCards}</div>` : ""}
     <div class="candidate-list">${rows || `<div class="empty-state">Waiting for candidate analysis.</div>`}</div>
     <p class="reasoning">${decision.reasoning || "Waiting for the next coordinator decision."}</p>
+  `;
+}
+
+function renderRecommendationCard(recommendation) {
+  const requested = recommendation.requested || {};
+  const suggested = recommendation.suggested || {};
+  return `
+    <article class="recommendation-card">
+      <div class="recommendation-head">
+        <span>Adaptive Scheduling</span>
+        <strong>${recommendation.summary || "Preferred interval unavailable"}</strong>
+      </div>
+      <div class="recommendation-window">
+        <span>Suggested Best Window</span>
+        <strong>${suggested.station_name || "Station"} • C${suggested.charger_id || "-"}</strong>
+        <em>${fmtWindow(suggested.start, suggested.end)}</em>
+      </div>
+      <div class="recommendation-meta">
+        <span>Estimated Delay: +${recommendation.estimated_delay_minutes || 0} min</span>
+        <span>Optimization Score: ${recommendation.optimization_score || 0}</span>
+      </div>
+      <p>${requested.station_name || "Preferred station"} C${requested.charger_id || "-"} unavailable.</p>
+    </article>
   `;
 }
 
@@ -241,6 +282,7 @@ function renderEvents(events) {
   els.eventStream.replaceChildren(...events.slice(0, 50).map((event) => {
     const row = document.createElement("div");
     row.className = "event-row";
+    if (event.event_type === "adaptive_allocation") row.classList.add("adaptive");
     row.innerHTML = `
       <time>${fmtTime(event.timestamp)}</time>
       <div>
@@ -357,6 +399,7 @@ function formatEventType(eventType) {
     coordinator_decision: "Coordinator decision",
     queue_updated: "Queue updated",
     conflict_detected: "Conflict detected",
+    adaptive_allocation: "Adaptive Allocation",
     rerouting: "Rerouting",
     queue_overflow: "Queue overflow",
     priority_preempted: "Priority preempted",

@@ -75,7 +75,7 @@ select {
 
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(5, minmax(105px, 1fr));
+  grid-template-columns: repeat(6, minmax(92px, 1fr));
   gap: 8px;
 }
 
@@ -266,6 +266,7 @@ select {
 }
 
 .timeline-track {
+  position: relative;
   height: 18px;
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -273,6 +274,28 @@ select {
   border-radius: 5px;
   overflow: hidden;
   background: rgba(8, 14, 26, 0.55);
+}
+
+.adaptive-overlay {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  z-index: 3;
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.adaptive-overlay.requested {
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px dashed rgba(251, 191, 36, 0.72);
+  box-shadow: inset 0 0 10px rgba(245, 158, 11, 0.18), 0 0 10px rgba(245, 158, 11, 0.16);
+}
+
+.adaptive-overlay.suggested {
+  background: linear-gradient(90deg, rgba(20, 184, 166, 0.48), rgba(34, 211, 238, 0.42));
+  border: 1px solid rgba(94, 234, 212, 0.72);
+  box-shadow: 0 0 16px rgba(45, 212, 191, 0.42);
+  animation: suggestedSlotGlow 2.8s ease-out 1;
 }
 
 .segment {
@@ -373,6 +396,21 @@ select {
   }
 }
 
+@keyframes suggestedSlotGlow {
+  0% {
+    opacity: 0.45;
+    box-shadow: 0 0 0 rgba(45, 212, 191, 0);
+  }
+  45% {
+    opacity: 0.95;
+    box-shadow: 0 0 18px rgba(45, 212, 191, 0.56);
+  }
+  100% {
+    opacity: 0.78;
+    box-shadow: 0 0 12px rgba(45, 212, 191, 0.28);
+  }
+}
+
 .free-window-strip {
   display: flex;
   flex-wrap: wrap;
@@ -406,6 +444,79 @@ select {
 .event-stream {
   display: grid;
   gap: 10px;
+}
+
+.recommendation-stack {
+  display: grid;
+  gap: 9px;
+}
+
+.recommendation-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  color: #fef3c7;
+  background:
+    radial-gradient(circle at top right, rgba(245, 158, 11, 0.2), transparent 42%),
+    rgba(30, 22, 9, 0.34);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.08), 0 0 22px rgba(245, 158, 11, 0.16);
+  animation: recommendationPulse 4.8s ease-in-out 1, recommendationSettle 14s ease-out forwards;
+}
+
+.recommendation-head,
+.recommendation-window,
+.recommendation-meta {
+  display: grid;
+  gap: 3px;
+}
+
+.recommendation-head span,
+.recommendation-window span,
+.recommendation-meta,
+.recommendation-card p {
+  color: rgba(253, 230, 138, 0.78);
+  font-size: 0.74rem;
+}
+
+.recommendation-head strong,
+.recommendation-window strong {
+  color: #fff7d6;
+  font-size: 0.86rem;
+}
+
+.recommendation-window em {
+  color: var(--text);
+  font-style: normal;
+  font-size: 0.82rem;
+}
+
+.recommendation-meta {
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.recommendation-card p {
+  margin: 0;
+}
+
+@keyframes recommendationPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.08), 0 0 16px rgba(245, 158, 11, 0.12);
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.24), 0 0 28px rgba(245, 158, 11, 0.26);
+  }
+}
+
+@keyframes recommendationSettle {
+  0%, 72% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.42;
+  }
 }
 
 .decision-summary {
@@ -533,6 +644,15 @@ select {
   color: var(--muted);
   font-size: 0.76rem;
   line-height: 1.4;
+}
+
+.event-row.adaptive {
+  border-color: rgba(251, 191, 36, 0.26);
+  background: rgba(30, 22, 9, 0.25);
+}
+
+.event-row.adaptive time {
+  color: #fbbf24;
 }
 
 .empty-state,

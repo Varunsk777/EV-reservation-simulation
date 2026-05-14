@@ -41,6 +41,7 @@ EVENT_TYPES = {
     "conflict_escalating",
     "allocation_retry",
     "station_congestion",
+    "adaptive_allocation",
 }
 LIFECYCLE = ("Searching", "Reserved", "Waiting", "Charging", "Completed", "Released")
 LOCK_TTL_SECONDS = 240
@@ -52,6 +53,8 @@ BASE_TICK_SECONDS = 3.2
 QUEUE_KEY = "sim:pending_queue"
 ARRIVAL_BUFFER_KEY = "sim:arrival_buffer"
 TICK_COUNTER_KEY = "sim:tick_counter"
+ADAPTIVE_RECOMMENDATIONS_KEY = "coordinator:adaptive_recommendations"
+ADAPTIVE_COUNTER_KEY = "sim:adaptive_reallocations"
 PHASE_MINUTES = 30
 # Tuned for ~50–70% occupancy, staggered load, and visible queue pressure (not empty, not saturated).
 PHASES = (
@@ -255,6 +258,7 @@ class OrchestrationService:
         events = self._event_snapshot()
         decision = self._latest_decision()
         metrics = self._metrics(stations, vehicles)
+        recommendations = self._recent_adaptive_recommendations(clock.current_time)
         return {
             "clock": {
                 "current_time": clock.current_time.isoformat(),
@@ -266,6 +270,7 @@ class OrchestrationService:
             "stations": stations,
             "vehicles": vehicles,
             "decision": decision,
+            "adaptive_recommendations": recommendations,
             "events": events,
         }
 
@@ -659,6 +664,11 @@ class OrchestrationService:
                     }
                 )
             free_windows = self._free_windows(chargers)
+            adaptive_overlays = self._station_adaptive_overlays(
+                station_id=station_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
             stations.append(
                 {
                     "station_id": station_id,
@@ -669,6 +679,7 @@ class OrchestrationService:
                     "time_axis": [tick.isoformat() for tick in ticks],
                     "chargers": chargers,
                     "free_windows": free_windows[:8],
+                    "adaptive_overlays": adaptive_overlays,
                 }
             )
         return stations
@@ -908,6 +919,9 @@ class OrchestrationService:
             return False
         ok = self._commit_allocation(request, allocation, now)
         if ok:
+            adaptive_recommendation = decision.get("adaptive_recommendation")
+            if adaptive_recommendation:
+                self._record_adaptive_recommendation(adaptive_recommendation)
             self._publish_event(
                 station_id=decision.get("selected_station"),
                 vehicle_id=vehicle_id,
@@ -1045,6 +1059,27 @@ class OrchestrationService:
             if not allocation and station_meta["rejection_reason"]:
                 failure_reason = station_meta["rejection_reason"]
                 failure_message = station_meta["failure_message"]
+        requested_charger = self._preferred_charger(vehicle_id, STATION_LIMITS.get(preferred_station, 1))
+        requested_end = earliest + duration
+        requested_intervals = self._read_station_timeline(preferred_station)
+        requested_overlap = self._interval_overlaps(
+            requested_intervals,
+            requested_charger,
+            earliest,
+            requested_end,
+        ) or self._db_conflict(preferred_station, requested_charger, earliest, requested_end)
+        adaptive_recommendation = None
+        if requested_overlap and best and best.get("allocation"):
+            adaptive_recommendation = self._build_adaptive_recommendation(
+                vehicle_id=vehicle_id,
+                priority=priority,
+                requested_station=preferred_station,
+                requested_charger=requested_charger,
+                requested_start=earliest,
+                requested_end=requested_end,
+                suggested=best["allocation"],
+                score=int(best["score"]),
+            )
         reasoning = (
             f"{vehicle_id} assigned to {STATION_NAMES[best['station_id']]} using lowest congestion/fragmentation score "
             f"({best['score']}) with wait {best['wait_minutes']} min."
@@ -1057,6 +1092,7 @@ class OrchestrationService:
             "candidate_stations": candidate_stations,
             "selected_station": best["station_id"] if best else None,
             "allocation": best["allocation"] if best else None,
+            "adaptive_recommendation": adaptive_recommendation,
             "reasoning": reasoning,
             "failure_reason": failure_reason,
             "failure_message": failure_message,
@@ -1142,6 +1178,141 @@ class OrchestrationService:
                 "failure_message": failure_message,
             },
         )
+
+    @staticmethod
+    def _preferred_charger(vehicle_id: str, charger_count: int) -> int:
+        if charger_count <= 1:
+            return 1
+        return (sum(ord(ch) for ch in vehicle_id) % charger_count) + 1
+
+    @staticmethod
+    def _interval_overlaps(intervals: list[dict[str, Any]], charger_id: int, start: datetime, end: datetime) -> bool:
+        return any(
+            int(item["charger_id"]) == charger_id
+            and datetime.fromisoformat(item["start"]) < end
+            and datetime.fromisoformat(item["end"]) > start
+            and item["status"] in {"reserved", "waiting", "charging"}
+            for item in intervals
+        )
+
+    def _build_adaptive_recommendation(
+        self,
+        *,
+        vehicle_id: str,
+        priority: int,
+        requested_station: int,
+        requested_charger: int,
+        requested_start: datetime,
+        requested_end: datetime,
+        suggested: dict[str, Any],
+        score: int,
+    ) -> dict[str, Any]:
+        suggested_start = datetime.fromisoformat(suggested["start"])
+        delay_minutes = max(0, int((suggested_start - requested_start).total_seconds() / 60))
+        optimization_score = -max(1, min(18, abs(score) // 4 + delay_minutes // 15 + (5 - min(priority, 5))))
+        return {
+            "id": f"{vehicle_id}:{int(requested_start.timestamp())}:{suggested['station_id']}:{suggested['charger_id']}",
+            "vehicle_id": vehicle_id,
+            "title": "Adaptive Scheduling",
+            "summary": "Preferred interval unavailable",
+            "requested": {
+                "station_id": requested_station,
+                "station_name": STATION_NAMES.get(requested_station, f"Station {requested_station}"),
+                "charger_id": requested_charger,
+                "start": requested_start.isoformat(),
+                "end": requested_end.isoformat(),
+            },
+            "suggested": {
+                "station_id": int(suggested["station_id"]),
+                "station_name": STATION_NAMES.get(int(suggested["station_id"]), f"Station {suggested['station_id']}"),
+                "charger_id": int(suggested["charger_id"]),
+                "start": suggested["start"],
+                "end": suggested["end"],
+            },
+            "estimated_delay_minutes": delay_minutes,
+            "optimization_score": optimization_score,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _record_adaptive_recommendation(self, recommendation: dict[str, Any]) -> None:
+        recent = self._redis_get_json(ADAPTIVE_RECOMMENDATIONS_KEY) or []
+        if any(item.get("id") == recommendation.get("id") for item in recent):
+            return
+        recent.insert(0, recommendation)
+        self._redis_set_json(ADAPTIVE_RECOMMENDATIONS_KEY, recent[:12])
+        current = self._redis_get_json(ADAPTIVE_COUNTER_KEY) or 0
+        try:
+            current = int(current)
+        except (TypeError, ValueError):
+            current = 0
+        self._redis_set_json(ADAPTIVE_COUNTER_KEY, current + 1)
+        requested = recommendation["requested"]
+        suggested = recommendation["suggested"]
+        start_label = self._display_time(datetime.fromisoformat(suggested["start"]))
+        end_label = self._display_time(datetime.fromisoformat(suggested["end"]))
+        self._publish_event(
+            station_id=int(suggested["station_id"]),
+            vehicle_id=recommendation.get("vehicle_id"),
+            event_type="adaptive_allocation",
+            message=(
+                f"Requested interval at {requested['station_name']} C{requested['charger_id']} unavailable. "
+                f"Suggested nearest available window: C{suggested['charger_id']} {start_label} - {end_label}."
+            ),
+        )
+
+    def _recent_adaptive_recommendations(self, now: datetime) -> list[dict[str, Any]]:
+        del now
+        recent = self._redis_get_json(ADAPTIVE_RECOMMENDATIONS_KEY) or []
+        fresh = []
+        wall_now = datetime.now(timezone.utc)
+        for item in recent:
+            created_at = item.get("created_at")
+            if not created_at:
+                continue
+            try:
+                age = wall_now - datetime.fromisoformat(created_at)
+            except ValueError:
+                continue
+            if age <= timedelta(minutes=45):
+                fresh.append(item)
+        if len(fresh) != len(recent):
+            self._redis_set_json(ADAPTIVE_RECOMMENDATIONS_KEY, fresh[:12])
+        return fresh[:6]
+
+    def _station_adaptive_overlays(
+        self,
+        *,
+        station_id: int,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict[str, Any]]:
+        overlays = []
+        for item in self._recent_adaptive_recommendations(self._read_clock().current_time):
+            for kind in ("requested", "suggested"):
+                slot = item.get(kind) or {}
+                if int(slot.get("station_id", -1)) != station_id:
+                    continue
+                start = datetime.fromisoformat(slot["start"])
+                end = datetime.fromisoformat(slot["end"])
+                if start < window_end and end > window_start:
+                    overlays.append(
+                        {
+                            "id": item.get("id"),
+                            "type": kind,
+                            "charger_id": int(slot["charger_id"]),
+                            "start": slot["start"],
+                            "end": slot["end"],
+                            "vehicle_id": item.get("vehicle_id"),
+                        }
+                    )
+        return overlays
+
+    @staticmethod
+    def _display_time(value: datetime) -> str:
+        if value.tzinfo is not None:
+            value = value.astimezone()
+        return value.strftime("%I:%M %p").lstrip("0").lower()
+
 
     def _advance_lifecycles(self, now: datetime) -> None:
         rows = self._reservation_rows(now - timedelta(hours=2), now + timedelta(hours=HORIZON_HOURS))
@@ -1735,6 +1906,7 @@ class OrchestrationService:
             "active_sessions": active_sessions,
             "pending_reservations": pending,
             "free_windows": free_windows,
+            "adaptive_reallocations": int(self._redis_get_json(ADAPTIVE_COUNTER_KEY) or 0),
         }
         self._redis_hset("sim:metrics", mapping={key: str(value) for key, value in metrics.items()})
         return metrics
