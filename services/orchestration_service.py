@@ -1434,10 +1434,36 @@ class OrchestrationService:
             "vehicle_id": vehicle_id,
             "priority_level": priority,
         }
-        logger.info("PostgreSQL users insert payload=%s", payload)
+        logger.info("PostgreSQL users ensure payload=%s", payload)
         with db_connection() as conn:
             with conn.cursor() as cur:
                 try:
+                    cur.execute(
+                        """
+                        SELECT COALESCE(user_id, id) AS user_id
+                        FROM core.users
+                        WHERE email = %s OR username = %s OR vehicle_id = %s
+                        ORDER BY COALESCE(user_id, id)
+                        LIMIT 1;
+                        """,
+                        (payload["email"], payload["username"], payload["vehicle_id"]),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        user_id = int(row[0])
+                        cur.execute(
+                            """
+                            UPDATE core.users
+                            SET priority_level = %s,
+                                id = COALESCE(id, user_id)
+                            WHERE COALESCE(user_id, id) = %s;
+                            """,
+                            (payload["priority_level"], user_id),
+                        )
+                        conn.commit()
+                        logger.info("PostgreSQL users reuse OK user_id=%s", user_id)
+                        return user_id
+
                     cur.execute(
                         """
                         INSERT INTO core.users (
@@ -1465,11 +1491,40 @@ class OrchestrationService:
                         raise RuntimeError("INSERT INTO core.users returned no row")
                     user_id = int(row[0])
                     cur.execute(
-                        "UPDATE core.users SET id = user_id WHERE user_id = %s;",
+                        "UPDATE core.users SET id = COALESCE(id, user_id) WHERE user_id = %s;",
                         (user_id,),
                     )
+                except errors.UniqueViolation:
+                    conn.rollback()
+                    with conn.cursor() as retry_cur:
+                        retry_cur.execute(
+                            """
+                            SELECT COALESCE(user_id, id) AS user_id
+                            FROM core.users
+                            WHERE email = %s OR username = %s OR vehicle_id = %s
+                            ORDER BY COALESCE(user_id, id)
+                            LIMIT 1;
+                            """,
+                            (payload["email"], payload["username"], payload["vehicle_id"]),
+                        )
+                        row = retry_cur.fetchone()
+                        if not row:
+                            raise
+                        user_id = int(row[0])
+                        retry_cur.execute(
+                            """
+                            UPDATE core.users
+                            SET priority_level = %s,
+                                id = COALESCE(id, user_id)
+                            WHERE COALESCE(user_id, id) = %s;
+                            """,
+                            (payload["priority_level"], user_id),
+                        )
+                    conn.commit()
+                    logger.info("PostgreSQL users reuse after conflict OK user_id=%s", user_id)
+                    return user_id
                 except Exception:
-                    logger.exception("PostgreSQL users insert failed; rolling back")
+                    logger.exception("PostgreSQL users ensure failed; rolling back")
                     conn.rollback()
                     raise
             conn.commit()

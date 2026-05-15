@@ -9,6 +9,8 @@ const state = {
   connected: false,
   clockAnchor: null,
   animationFrame: null,
+  microOpenStations: new Set(),
+  microPulseUntil: new Map(),
 };
 
 const els = {
@@ -64,7 +66,7 @@ function render(payload) {
   state.payload = payload;
   renderControls(payload.clock || {});
   renderMetrics(payload.metrics || {});
-  renderStations(payload.stations || []);
+  renderStations(payload.stations || [], payload.events || [], payload.adaptive_recommendations || []);
   renderDecision(payload.decision || {}, payload.adaptive_recommendations || []);
   renderLifecycle(payload.vehicles || []);
   renderEvents(payload.events || []);
@@ -86,20 +88,22 @@ function renderMetrics(metrics) {
   els.adaptiveReallocations.textContent = metrics.adaptive_reallocations || 0;
 }
 
-function renderStations(stations) {
+function renderStations(stations, events = [], recommendations = []) {
   if (!stations.length) {
     els.stationTimelines.innerHTML = `<div class="empty-state">No station timeline state available.</div>`;
     return;
   }
 
   const simNowMs = getSimNowMs();
-  els.stationTimelines.replaceChildren(...stations.map((station) => renderStation(station, simNowMs)));
+  els.stationTimelines.replaceChildren(...stations.map((station) => renderStation(station, simNowMs, events, recommendations)));
 }
 
-function renderStation(station, simNowMs) {
+function renderStation(station, simNowMs, events = [], recommendations = []) {
   const details = document.createElement("details");
   details.className = "station-panel";
   details.open = true;
+  const stationKey = String(station.station_id);
+  const microOpen = state.microOpenStations.has(stationKey);
 
   const summary = document.createElement("summary");
   const busyCount = station.chargers.filter((charger) => charger.state !== "free").length;
@@ -108,8 +112,23 @@ function renderStation(station, simNowMs) {
       <span class="station-overline">${station.location || "Coordination zone"}</span>
       <strong>${station.station_name}</strong>
     </div>
-    <span>${busyCount}/${station.charger_count} active</span>
+    <div class="station-summary-actions">
+      <span>${busyCount}/${station.charger_count} active</span>
+      <button class="micro-toggle ${microOpen ? "open" : ""}" type="button" aria-expanded="${microOpen}">
+        ${microOpen ? "Hide Micro Scheduling" : "View Micro Scheduling"}
+      </button>
+    </div>
   `;
+  summary.querySelector(".micro-toggle").addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (state.microOpenStations.has(stationKey)) {
+      state.microOpenStations.delete(stationKey);
+    } else {
+      state.microOpenStations.add(stationKey);
+    }
+    render(state.payload);
+  });
   details.appendChild(summary);
 
   const timeline = document.createElement("div");
@@ -157,7 +176,214 @@ function renderStation(station, simNowMs) {
     windows.appendChild(pill);
   }
   details.appendChild(windows);
+  if (microOpen) {
+    details.appendChild(renderMicroScheduling(station, simNowMs, events, recommendations));
+  }
   return details;
+}
+
+function renderMicroScheduling(station, simNowMs, events = [], recommendations = []) {
+  const shell = document.createElement("section");
+  shell.className = "micro-scheduling";
+
+  const recommendation = stationMicroRecommendation(station, recommendations);
+  const upcoming = collectUpcomingReservations(station, simNowMs);
+  const stationEvents = events
+    .filter((event) => String(event.station_id || "") === String(station.station_id))
+    .slice(0, 7);
+
+  const head = document.createElement("div");
+  head.className = "micro-head";
+  head.innerHTML = `
+    <div>
+      <span class="micro-kicker">Realtime Micro-Slot Allocation</span>
+      <strong>Adaptive charger windows</strong>
+    </div>
+    <div class="micro-legend">
+      <span class="micro-dot micro-dot-charging">Charging</span>
+      <span class="micro-dot micro-dot-reserved">Reserved</span>
+      <span class="micro-dot micro-dot-available">Available</span>
+      <span class="micro-dot micro-dot-suggested">Suggested</span>
+    </div>
+  `;
+  shell.appendChild(head);
+
+  if (recommendation) {
+    const card = document.createElement("article");
+    card.className = "micro-recommendation";
+    card.innerHTML = `
+      <span>Suggested Alternative</span>
+      <strong>C${recommendation.suggested.charger_id} • ${fmtWindow(recommendation.suggested.start, recommendation.suggested.end)}</strong>
+      <em>Estimated Delay: +${recommendation.estimated_delay_minutes || 0} min</em>
+    `;
+    shell.appendChild(card);
+  }
+
+  const grid = document.createElement("div");
+  grid.className = "micro-grid";
+  for (const charger of station.chargers || []) {
+    grid.appendChild(renderMicroCharger(charger, station, simNowMs));
+  }
+  shell.appendChild(grid);
+
+  const footer = document.createElement("div");
+  footer.className = "micro-footer";
+  footer.appendChild(renderUpcomingStrip(upcoming));
+  footer.appendChild(renderMicroFeed(stationEvents));
+  shell.appendChild(footer);
+
+  return shell;
+}
+
+function renderMicroCharger(charger, station, simNowMs) {
+  const row = document.createElement("div");
+  row.className = "micro-row";
+  const occupied = (charger.segments || []).filter((segment) => segment.status !== "available").length;
+  row.innerHTML = `
+    <div class="micro-charger-label">
+      <strong>C${charger.charger_id}</strong>
+      <span>${charger.state === "free" ? `${occupied} allocated slots` : charger.state}</span>
+    </div>
+  `;
+
+  const rail = document.createElement("div");
+  rail.className = "micro-rail";
+  const overlays = (station.adaptive_overlays || []).filter((item) => Number(item.charger_id) === Number(charger.charger_id));
+  for (const segment of charger.segments || []) {
+    rail.appendChild(renderMicroSlot(segment, charger.charger_id, overlays, simNowMs));
+  }
+  row.appendChild(rail);
+  return row;
+}
+
+function renderMicroSlot(segment, chargerId, overlays, simNowMs) {
+  const slot = document.createElement("span");
+  const status = microSlotStatus(segment, overlays, simNowMs);
+  const pulseKey = `${chargerId}:${segment.start}:${segment.vehicle_id || status}`;
+  const isAllocated = Boolean(segment.vehicle_id) && ["reserved", "waiting", "charging"].includes(segment.status);
+  const now = performance.now();
+  if (isAllocated && !state.microPulseUntil.has(pulseKey)) {
+    state.microPulseUntil.set(pulseKey, now + 2800);
+  }
+  const newlyAssigned = isAllocated && (state.microPulseUntil.get(pulseKey) || 0) > now;
+  slot.className = `micro-slot ${status}${newlyAssigned ? " newly-assigned" : ""}`;
+  slot.dataset.startMs = String(Date.parse(segment.start));
+  slot.dataset.endMs = String(Date.parse(segment.end));
+  slot.dataset.status = status;
+  slot.title = `${fmtWindow(segment.start, segment.end)} ${microSlotLabel(status)}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
+
+  const label = document.createElement("span");
+  label.textContent = fmtTime(segment.start);
+  slot.appendChild(label);
+  return slot;
+}
+
+function microSlotStatus(segment, overlays, simNowMs) {
+  const suggested = overlays.some((overlay) => overlay.type === "suggested" && intervalsOverlap(segment.start, segment.end, overlay.start, overlay.end));
+  if (suggested && segment.status === "available") return "suggested";
+  const phase = segmentPhase(segment.start, segment.end, simNowMs);
+  if (phase === "past" && segment.status !== "available") return "completed";
+  if (phase === "current" && ["reserved", "waiting", "charging"].includes(segment.status)) return "charging";
+  if (["reserved", "waiting"].includes(segment.status)) return "reserved";
+  if (segment.status === "charging") return "charging";
+  if (segment.status === "completed") return "completed";
+  return "available";
+}
+
+function microSlotLabel(status) {
+  const labels = {
+    charging: "Active charging",
+    reserved: "Reserved",
+    suggested: "Adaptive suggestion",
+    completed: "Completed",
+    available: "Available",
+  };
+  return labels[status] || "Available";
+}
+
+function collectUpcomingReservations(station, simNowMs) {
+  const items = [];
+  for (const charger of station.chargers || []) {
+    let open = null;
+    for (const segment of charger.segments || []) {
+      const startMs = Date.parse(segment.start);
+      const reserved = startMs >= simNowMs && ["reserved", "waiting", "charging"].includes(segment.status);
+      const vehicleId = segment.vehicle_id || "EV pending";
+      if (!reserved) {
+        if (open) items.push(open);
+        open = null;
+        continue;
+      }
+      if (open && open.vehicle_id === vehicleId && open.end === segment.start) {
+        open.end = segment.end;
+      } else {
+        if (open) items.push(open);
+        open = {
+          key: `${vehicleId}:${charger.charger_id}:${segment.start}`,
+          vehicle_id: vehicleId,
+          charger_id: charger.charger_id,
+          start: segment.start,
+          end: segment.end,
+        };
+      }
+    }
+    if (open) items.push(open);
+  }
+  return items
+    .sort((a, b) => Date.parse(a.start) - Date.parse(b.start))
+    .filter((item, index, list) => list.findIndex((other) => other.key === item.key) === index)
+    .slice(0, 5);
+}
+
+function renderUpcomingStrip(upcoming) {
+  const block = document.createElement("div");
+  block.className = "micro-upcoming";
+  block.innerHTML = `<h3>Upcoming Reservations</h3>`;
+  const strip = document.createElement("div");
+  strip.className = "micro-reservation-strip";
+  if (!upcoming.length) {
+    strip.innerHTML = `<span class="micro-muted">No near-horizon reservations queued.</span>`;
+  } else {
+    for (const item of upcoming) {
+      const pill = document.createElement("span");
+      pill.textContent = `${item.vehicle_id} • C${item.charger_id} • ${fmtWindow(item.start, item.end)}`;
+      strip.appendChild(pill);
+    }
+  }
+  block.appendChild(strip);
+  return block;
+}
+
+function renderMicroFeed(events) {
+  const block = document.createElement("div");
+  block.className = "micro-feed";
+  block.innerHTML = `<h3>Micro Activity Feed</h3>`;
+  const list = document.createElement("div");
+  list.className = "micro-feed-list";
+  if (!events.length) {
+    list.innerHTML = `<div class="micro-feed-row"><time>--:--</time><span>Awaiting station-local orchestration events</span></div>`;
+  } else {
+    for (const event of events) {
+      const row = document.createElement("div");
+      row.className = "micro-feed-row";
+      if (event.event_type === "adaptive_allocation") row.classList.add("adaptive");
+      row.innerHTML = `<time>${fmtTime(event.timestamp)}</time><span>${formatEventType(event.event_type)}</span>`;
+      list.appendChild(row);
+    }
+  }
+  block.appendChild(list);
+  return block;
+}
+
+function stationMicroRecommendation(station, recommendations) {
+  return recommendations.find((item) => {
+    const suggested = item.suggested || {};
+    return String(suggested.station_id || "") === String(station.station_id);
+  });
+}
+
+function intervalsOverlap(startA, endA, startB, endB) {
+  return Date.parse(startA) < Date.parse(endB) && Date.parse(endA) > Date.parse(startB);
 }
 
 function renderChargerRow(charger, simNowMs, overlays = [], boundsStartMs = 0, boundsEndMs = 1) {
@@ -373,6 +599,14 @@ function updateTimelineDynamics(simNowMs) {
     segment.classList.toggle("current", current);
     segment.classList.toggle("future", !past && !current);
     segment.classList.toggle("active", status === "charging" && current);
+  });
+
+  document.querySelectorAll(".micro-slot").forEach((slot) => {
+    const startMs = Number(slot.dataset.startMs);
+    const endMs = Number(slot.dataset.endMs);
+    const status = slot.dataset.status || "available";
+    const current = startMs <= simNowMs && simNowMs < endMs;
+    slot.classList.toggle("is-current", current && ["charging", "reserved"].includes(status));
   });
 }
 
