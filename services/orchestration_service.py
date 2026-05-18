@@ -43,6 +43,8 @@ EVENT_TYPES = {
     "station_congestion",
     "adaptive_allocation",
 }
+SOLID_SCHEDULER_STATES = {"confirmed", "reserved", "active"}
+ANALYTICAL_SCHEDULER_STATES = {"suggested", "rejected", "conflicting", "adaptive_candidate"}
 LIFECYCLE = ("Searching", "Reserved", "Waiting", "Charging", "Completed", "Released")
 LOCK_TTL_SECONDS = 240
 SEGMENT_MINUTES = 15
@@ -614,9 +616,11 @@ class OrchestrationService:
         now = self._read_clock().current_time
         horizon = now + timedelta(hours=HORIZON_HOURS)
         rows = self._reservation_rows(now - timedelta(hours=1), horizon)
+        recent_adaptive = self._recent_adaptive_recommendations(now)
         intervals_by_station: dict[int, list[dict[str, Any]]] = {station_id: [] for station_id in STATION_LIMITS}
         for row in rows:
             status = self._interval_status(row, now)
+            scheduler_state = self._solid_scheduler_state(row, status, recent_adaptive)
             vid = str(row.get("vehicle_id") or "")
             _plug_m, linger_m = self._vehicle_timing_jitter(vid)
             nominal_end = row["reservation_end"]
@@ -631,6 +635,8 @@ class OrchestrationService:
                 "start": row["reservation_start"].isoformat(),
                 "end": display_end.isoformat(),
                 "status": status,
+                "scheduler_state": scheduler_state,
+                "render_mode": "solid",
             }
             intervals_by_station.setdefault(row["station_id"], []).append(interval)
             st = row["reservation_start"]
@@ -668,6 +674,7 @@ class OrchestrationService:
                 station_id=station_id,
                 window_start=window_start,
                 window_end=window_end,
+                intervals=intervals,
             )
             stations.append(
                 {
@@ -700,12 +707,16 @@ class OrchestrationService:
                 None,
             )
             status = overlap["status"] if overlap else "available"
+            scheduler_state = overlap.get("scheduler_state") if overlap else "available"
             segments.append(
                 {
                     "start": start.isoformat(),
                     "end": end.isoformat(),
                     "status": status,
+                    "scheduler_state": scheduler_state,
+                    "render_mode": "solid" if scheduler_state in SOLID_SCHEDULER_STATES else "base",
                     "vehicle_id": overlap.get("vehicle_id") if overlap else None,
+                    "reservation_id": overlap.get("reservation_id") if overlap else None,
                 }
             )
         return segments
@@ -949,13 +960,26 @@ class OrchestrationService:
                 message=f"{vehicle_id} delayed; selected slot still lock-held.",
             )
             return False
+        allocation_start = datetime.fromisoformat(allocation["start"])
+        allocation_end = datetime.fromisoformat(allocation["end"])
+        if self._db_conflict(allocation["station_id"], allocation["charger_id"], allocation_start, allocation_end):
+            self._redis_delete(lock_key)
+            request["attempts"] = int(request.get("attempts", 0)) + 1
+            request["next_retry_at"] = (now + timedelta(minutes=7)).isoformat()
+            self._publish_event(
+                station_id=allocation["station_id"],
+                vehicle_id=vehicle_id,
+                event_type="conflict_detected",
+                message=f"{vehicle_id} rejected because the selected interval was claimed before commit.",
+            )
+            return False
         reservation_id = self._insert_reservation(
             user_id=user_id,
             vehicle_id=vehicle_id,
             station_id=allocation["station_id"],
             charger_id=allocation["charger_id"],
-            start=datetime.fromisoformat(allocation["start"]),
-            end=datetime.fromisoformat(allocation["end"]),
+            start=allocation_start,
+            end=allocation_end,
         )
         if reservation_id is None:
             self._redis_delete(lock_key)
@@ -1062,12 +1086,15 @@ class OrchestrationService:
         requested_charger = self._preferred_charger(vehicle_id, STATION_LIMITS.get(preferred_station, 1))
         requested_end = earliest + duration
         requested_intervals = self._read_station_timeline(preferred_station)
-        requested_overlap = self._interval_overlaps(
+        blocking_interval = self._find_overlapping_interval(
             requested_intervals,
             requested_charger,
             earliest,
             requested_end,
-        ) or self._db_conflict(preferred_station, requested_charger, earliest, requested_end)
+        )
+        requested_overlap = bool(blocking_interval) or self._db_conflict(
+            preferred_station, requested_charger, earliest, requested_end
+        )
         adaptive_recommendation = None
         if requested_overlap and best and best.get("allocation"):
             adaptive_recommendation = self._build_adaptive_recommendation(
@@ -1079,6 +1106,7 @@ class OrchestrationService:
                 requested_end=requested_end,
                 suggested=best["allocation"],
                 score=int(best["score"]),
+                blocking_interval=blocking_interval,
             )
         reasoning = (
             f"{vehicle_id} assigned to {STATION_NAMES[best['station_id']]} using lowest congestion/fragmentation score "
@@ -1195,6 +1223,41 @@ class OrchestrationService:
             for item in intervals
         )
 
+    @staticmethod
+    def _find_overlapping_interval(
+        intervals: list[dict[str, Any]], charger_id: int, start: datetime, end: datetime
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in intervals
+                if int(item["charger_id"]) == charger_id
+                and datetime.fromisoformat(item["start"]) < end
+                and datetime.fromisoformat(item["end"]) > start
+                and item["status"] in {"reserved", "waiting", "charging"}
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _solid_scheduler_state(
+        row: dict[str, Any], status: str, adaptive_recommendations: list[dict[str, Any]]
+    ) -> str:
+        if status == "charging":
+            return "active"
+        if status not in {"reserved", "waiting"}:
+            return "reserved" if status == "reserved" else status
+        for recommendation in adaptive_recommendations:
+            suggested = recommendation.get("suggested") or {}
+            if (
+                int(suggested.get("station_id", -1)) == int(row["station_id"])
+                and int(suggested.get("charger_id", -1)) == int(row["charger_id"])
+                and suggested.get("start") == row["reservation_start"].isoformat()
+                and suggested.get("end") == row["reservation_end"].isoformat()
+            ):
+                return "confirmed"
+        return "reserved"
+
     def _build_adaptive_recommendation(
         self,
         *,
@@ -1206,6 +1269,7 @@ class OrchestrationService:
         requested_end: datetime,
         suggested: dict[str, Any],
         score: int,
+        blocking_interval: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         suggested_start = datetime.fromisoformat(suggested["start"])
         delay_minutes = max(0, int((suggested_start - requested_start).total_seconds() / 60))
@@ -1231,6 +1295,19 @@ class OrchestrationService:
             },
             "estimated_delay_minutes": delay_minutes,
             "optimization_score": optimization_score,
+            "conflict_reason": "requested interval overlaps a hard-confirmed allocation",
+            "blocking_interval": (
+                {
+                    "reservation_id": blocking_interval.get("reservation_id"),
+                    "vehicle_id": blocking_interval.get("vehicle_id"),
+                    "charger_id": blocking_interval.get("charger_id"),
+                    "start": blocking_interval.get("start"),
+                    "end": blocking_interval.get("end"),
+                    "status": blocking_interval.get("status"),
+                }
+                if blocking_interval
+                else None
+            ),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1285,8 +1362,10 @@ class OrchestrationService:
         station_id: int,
         window_start: datetime,
         window_end: datetime,
+        intervals: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         overlays = []
+        solid_intervals = intervals or []
         for item in self._recent_adaptive_recommendations(self._read_clock().current_time):
             for kind in ("requested", "suggested"):
                 slot = item.get(kind) or {}
@@ -1294,15 +1373,23 @@ class OrchestrationService:
                     continue
                 start = datetime.fromisoformat(slot["start"])
                 end = datetime.fromisoformat(slot["end"])
+                if kind == "suggested" and self._interval_overlaps(
+                    solid_intervals, int(slot["charger_id"]), start, end
+                ):
+                    continue
                 if start < window_end and end > window_start:
                     overlays.append(
                         {
                             "id": item.get("id"),
-                            "type": kind,
+                            "type": "conflicting" if kind == "requested" else "suggested",
+                            "render_mode": "dotted",
+                            "scheduler_state": "conflicting" if kind == "requested" else "suggested",
                             "charger_id": int(slot["charger_id"]),
                             "start": slot["start"],
                             "end": slot["end"],
                             "vehicle_id": item.get("vehicle_id"),
+                            "reason": item.get("conflict_reason", "analysis interval"),
+                            "blocking_interval": item.get("blocking_interval"),
                         }
                     )
         return overlays

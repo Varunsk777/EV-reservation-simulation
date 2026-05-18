@@ -179,10 +179,12 @@ select {
 
 .charging { color: #67e8f9; }
 .reserved { color: #fbbf24; }
+.confirmed { color: #4ade80; }
 .waiting { color: #fde68a; }
 .completed { color: #cbd5e1; }
 .released { color: #94a3b8; }
-.available { color: #86efac; }
+.available { color: #64748b; }
+.conflicting { color: #fca5a5; }
 .fault { color: #fca5a5; }
 
 .station-timelines {
@@ -298,40 +300,49 @@ select {
   height: 18px;
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
-  gap: 2px;
+  gap: 1px;
   border-radius: 5px;
   overflow: hidden;
-  background: rgba(8, 14, 26, 0.55);
+  background: rgba(3, 7, 18, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.08);
 }
 
 .adaptive-overlay {
   position: absolute;
-  top: 1px;
-  bottom: 1px;
+  top: 3px;
+  bottom: 3px;
   z-index: 3;
-  border-radius: 4px;
+  border-radius: 3px;
   pointer-events: none;
+  opacity: 0.54;
 }
 
-.adaptive-overlay.requested {
-  background: rgba(245, 158, 11, 0.14);
-  border: 1px dashed rgba(251, 191, 36, 0.72);
-  box-shadow: inset 0 0 10px rgba(245, 158, 11, 0.18), 0 0 10px rgba(245, 158, 11, 0.16);
+.adaptive-overlay.conflicting {
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(248, 113, 113, 0.18) 0 4px,
+      rgba(248, 113, 113, 0.04) 4px 8px
+    );
+  border: 1px dashed rgba(252, 165, 165, 0.62);
 }
 
 .adaptive-overlay.suggested {
-  background: linear-gradient(90deg, rgba(20, 184, 166, 0.48), rgba(34, 211, 238, 0.42));
-  border: 1px solid rgba(94, 234, 212, 0.72);
-  box-shadow: 0 0 16px rgba(45, 212, 191, 0.42);
-  animation: suggestedSlotGlow 2.8s ease-out 1;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(94, 234, 212, 0.16) 0 4px,
+      rgba(94, 234, 212, 0.03) 4px 8px
+    );
+  border: 1px dashed rgba(94, 234, 212, 0.52);
 }
 
 .segment {
   min-width: 0;
-  border-radius: 2px;
-  background: rgba(34, 197, 94, 0.14);
-  border: 1px solid rgba(34, 197, 94, 0.2);
-  opacity: 0.62;
+  border-radius: 1px;
+  background: rgba(15, 23, 42, 0.82);
+  border: 1px solid rgba(51, 65, 85, 0.5);
+  opacity: 0.76;
   transition:
     background-color 380ms ease,
     border-color 380ms ease,
@@ -341,21 +352,24 @@ select {
 }
 
 .segment.available {
-  background: rgba(34, 197, 94, 0.12);
-  border-color: rgba(134, 239, 172, 0.2);
+  background: rgba(15, 23, 42, 0.72);
+  border-color: rgba(51, 65, 85, 0.55);
 }
 
-.segment.reserved {
-  background: rgba(217, 119, 6, 0.46);
-  border-color: rgba(251, 191, 36, 0.44);
+.segment.reserved,
+.segment.waiting,
+.segment.state-reserved {
+  background: rgba(245, 158, 11, 0.58);
+  border-color: rgba(251, 191, 36, 0.58);
 }
 
-.segment.waiting {
-  background: rgba(250, 204, 21, 0.54);
-  border-color: rgba(254, 240, 138, 0.6);
+.segment.state-confirmed {
+  background: rgba(34, 197, 94, 0.66);
+  border-color: rgba(74, 222, 128, 0.72);
 }
 
-.segment.charging {
+.segment.charging,
+.segment.state-active {
   background: rgba(14, 165, 233, 0.8);
   border-color: rgba(103, 232, 249, 0.9);
 }
@@ -383,11 +397,13 @@ select {
   opacity: 0.95;
 }
 
-.segment.charging.current {
+.segment.charging.current,
+.segment.state-active.current {
   box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5), 0 0 14px rgba(34, 211, 238, 0.35);
 }
 
-.segment.charging.active {
+.segment.charging.active,
+.segment.state-active.active {
   animation: chargePulse 1.5s ease-in-out infinite;
 }
 
@@ -526,12 +542,17 @@ select {
 }
 
 .micro-dot-reserved::before {
-  background: #1d4ed8;
-  box-shadow: 0 0 10px rgba(37, 99, 235, 0.46);
+  background: #f59e0b;
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.46);
+}
+
+.micro-dot-confirmed::before {
+  background: #22c55e;
+  box-shadow: 0 0 10px rgba(34, 197, 94, 0.45);
 }
 
 .micro-dot-available::before {
-  background: rgba(148, 163, 184, 0.36);
+  background: rgba(100, 116, 139, 0.66);
 }
 
 .micro-dot-suggested::before {
@@ -624,13 +645,15 @@ select {
 }
 
 .micro-slot.available {
-  opacity: 0.45;
+  opacity: 0.48;
+  background: rgba(15, 23, 42, 0.72);
+  border-color: rgba(51, 65, 85, 0.48);
 }
 
 .micro-slot.reserved {
   opacity: 0.86;
-  background: linear-gradient(180deg, rgba(29, 78, 216, 0.5), rgba(30, 64, 175, 0.28));
-  border-color: rgba(96, 165, 250, 0.36);
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.58), rgba(180, 83, 9, 0.38));
+  border-color: rgba(251, 191, 36, 0.5);
 }
 
 .micro-slot.charging {
@@ -640,11 +663,21 @@ select {
   box-shadow: inset 0 0 12px rgba(207, 250, 254, 0.12), 0 0 13px rgba(34, 211, 238, 0.27);
 }
 
+.micro-slot.confirmed {
+  opacity: 0.92;
+  background: linear-gradient(180deg, rgba(34, 197, 94, 0.62), rgba(21, 128, 61, 0.38));
+  border-color: rgba(74, 222, 128, 0.58);
+}
+
 .micro-slot.suggested {
-  opacity: 0.94;
-  background: rgba(245, 158, 11, 0.08);
-  border-color: rgba(251, 191, 36, 0.84);
-  box-shadow: inset 0 0 12px rgba(245, 158, 11, 0.1), 0 0 13px rgba(245, 158, 11, 0.18);
+  opacity: 0.58;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(245, 158, 11, 0.16) 0 4px,
+      rgba(245, 158, 11, 0.03) 4px 8px
+    );
+  border-color: rgba(251, 191, 36, 0.48);
 }
 
 .micro-slot.completed {

@@ -2,6 +2,18 @@ const lifecycleStates = ["Searching", "Reserved", "Waiting", "Charging", "Comple
 const BASE_TICK_SECONDS = 3.2;
 const MIN_TICK_SECONDS = 0.45;
 const knownSegmentStates = new Set(["available", "reserved", "waiting", "charging", "completed", "fault"]);
+const knownSchedulerStates = new Set([
+  "available",
+  "active",
+  "reserved",
+  "confirmed",
+  "suggested",
+  "rejected",
+  "conflicting",
+  "adaptive_candidate",
+  "completed",
+  "fault",
+]);
 
 const state = {
   socket: null,
@@ -202,8 +214,9 @@ function renderMicroScheduling(station, simNowMs, events = [], recommendations =
     <div class="micro-legend">
       <span class="micro-dot micro-dot-charging">Charging</span>
       <span class="micro-dot micro-dot-reserved">Reserved</span>
+      <span class="micro-dot micro-dot-confirmed">Confirmed allocation</span>
       <span class="micro-dot micro-dot-available">Available</span>
-      <span class="micro-dot micro-dot-suggested">Suggested</span>
+      <span class="micro-dot micro-dot-suggested">Analysis overlay</span>
     </div>
   `;
   shell.appendChild(head);
@@ -212,7 +225,7 @@ function renderMicroScheduling(station, simNowMs, events = [], recommendations =
     const card = document.createElement("article");
     card.className = "micro-recommendation";
     card.innerHTML = `
-      <span>Suggested Alternative</span>
+      <span>Finalized Alternative</span>
       <strong>C${recommendation.suggested.charger_id} • ${fmtWindow(recommendation.suggested.start, recommendation.suggested.end)}</strong>
       <em>Estimated Delay: +${recommendation.estimated_delay_minutes || 0} min</em>
     `;
@@ -279,6 +292,9 @@ function renderMicroSlot(segment, chargerId, overlays, simNowMs) {
 }
 
 function microSlotStatus(segment, overlays, simNowMs) {
+  const stateType = normalizeSchedulerState(segment.scheduler_state || segment.status);
+  if (stateType === "confirmed") return "confirmed";
+  if (stateType === "active") return "charging";
   const suggested = overlays.some((overlay) => overlay.type === "suggested" && intervalsOverlap(segment.start, segment.end, overlay.start, overlay.end));
   if (suggested && segment.status === "available") return "suggested";
   const phase = segmentPhase(segment.start, segment.end, simNowMs);
@@ -294,6 +310,7 @@ function microSlotLabel(status) {
   const labels = {
     charging: "Active charging",
     reserved: "Reserved",
+    confirmed: "Finalized allocation",
     suggested: "Adaptive suggestion",
     completed: "Completed",
     available: "Available",
@@ -400,14 +417,16 @@ function renderChargerRow(charger, simNowMs, overlays = [], boundsStartMs = 0, b
   for (const segment of charger.segments || []) {
     const block = document.createElement("span");
     const status = normalizeSegmentStatus(segment.status);
-    block.className = `segment ${status} ${segmentPhase(segment.start, segment.end, simNowMs)}`;
+    const schedulerState = normalizeSchedulerState(segment.scheduler_state || status);
+    block.className = `segment ${status} state-${schedulerState} ${segmentPhase(segment.start, segment.end, simNowMs)}`;
     block.dataset.startMs = String(Date.parse(segment.start));
     block.dataset.endMs = String(Date.parse(segment.end));
     block.dataset.status = status;
-    if (status === "charging" && isCurrentSegment(segment.start, segment.end, simNowMs)) {
+    block.dataset.schedulerState = schedulerState;
+    if ((status === "charging" || schedulerState === "active") && isCurrentSegment(segment.start, segment.end, simNowMs)) {
       block.classList.add("active");
     }
-    block.title = `${fmtWindow(segment.start, segment.end)} ${segment.status}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
+    block.title = `${fmtWindow(segment.start, segment.end)} ${schedulerStateLabel(schedulerState)}${segment.vehicle_id ? ` ${segment.vehicle_id}` : ""}`;
     track.appendChild(block);
   }
   for (const overlay of overlays) {
@@ -417,10 +436,13 @@ function renderChargerRow(charger, simNowMs, overlays = [], boundsStartMs = 0, b
     const total = Math.max(1, boundsEndMs - boundsStartMs);
     const left = Math.max(0, Math.min(100, ((startMs - boundsStartMs) / total) * 100));
     const right = Math.max(0, Math.min(100, ((endMs - boundsStartMs) / total) * 100));
-    marker.className = `adaptive-overlay ${overlay.type === "requested" ? "requested" : "suggested"}`;
+    const overlayType = overlay.type === "conflicting" || overlay.type === "requested" ? "conflicting" : "suggested";
+    marker.className = `adaptive-overlay ${overlayType}`;
     marker.style.left = `${left}%`;
     marker.style.width = `${Math.max(3, right - left)}%`;
-    marker.title = `${overlay.type === "requested" ? "Requested overlap" : "Suggested window"} ${fmtWindow(overlay.start, overlay.end)}`;
+    const blocking = overlay.blocking_interval;
+    const blockingText = blocking ? ` Blocked by C${blocking.charger_id} ${fmtWindow(blocking.start, blocking.end)}.` : "";
+    marker.title = `${overlayType === "conflicting" ? "Conflict analysis" : "Suggested analysis"} ${fmtWindow(overlay.start, overlay.end)}. ${overlay.reason || ""}${blockingText}`;
     track.appendChild(marker);
   }
   row.appendChild(track);
@@ -439,10 +461,11 @@ function renderDecision(decision, recommendations = []) {
   `).join("");
 
   const recommendationCards = recommendations.slice(0, 3).map(renderRecommendationCard).join("");
+  const allocation = decision.allocation || {};
   els.decisionBody.innerHTML = `
     <div class="decision-summary">
       <span>Final Allocation</span>
-      <strong>${selected ? `Station ${selected}` : "Pending"}</strong>
+      <strong>${allocation.station_id ? `${stationName(allocation.station_id)} • C${allocation.charger_id} • ${fmtWindow(allocation.start, allocation.end)}` : selected ? `Station ${selected}` : "Pending"}</strong>
     </div>
     ${recommendationCards ? `<div class="recommendation-stack">${recommendationCards}</div>` : ""}
     <div class="candidate-list">${rows || `<div class="empty-state">Waiting for candidate analysis.</div>`}</div>
@@ -460,7 +483,7 @@ function renderRecommendationCard(recommendation) {
         <strong>${recommendation.summary || "Preferred interval unavailable"}</strong>
       </div>
       <div class="recommendation-window">
-        <span>Suggested Best Window</span>
+        <span>Finalized Clean Window</span>
         <strong>${suggested.station_name || "Station"} • C${suggested.charger_id || "-"}</strong>
         <em>${fmtWindow(suggested.start, suggested.end)}</em>
       </div>
@@ -468,7 +491,7 @@ function renderRecommendationCard(recommendation) {
         <span>Estimated Delay: +${recommendation.estimated_delay_minutes || 0} min</span>
         <span>Optimization Score: ${recommendation.optimization_score || 0}</span>
       </div>
-      <p>${requested.station_name || "Preferred station"} C${requested.charger_id || "-"} unavailable.</p>
+      <p>${conflictSummary(recommendation, requested)}</p>
     </article>
   `;
 }
@@ -580,6 +603,36 @@ function normalizeSegmentStatus(status) {
   return knownSegmentStates.has(status) ? status : "available";
 }
 
+function normalizeSchedulerState(status) {
+  return knownSchedulerStates.has(status) ? status : "available";
+}
+
+function schedulerStateLabel(status) {
+  const labels = {
+    active: "Active charging",
+    reserved: "Reserved booking",
+    confirmed: "Finalized scheduler allocation",
+    suggested: "Suggested analysis",
+    conflicting: "Conflict analysis",
+    available: "Available",
+    completed: "Completed",
+    fault: "Fault",
+  };
+  return labels[status] || "Available";
+}
+
+function stationName(stationId) {
+  return `Station ${String.fromCharCode(64 + Number(stationId || 0))}`;
+}
+
+function conflictSummary(recommendation, requested) {
+  const blocking = recommendation.blocking_interval;
+  if (blocking) {
+    return `${requested.station_name || "Preferred station"} C${requested.charger_id || "-"} overlaps ${fmtWindow(blocking.start, blocking.end)}.`;
+  }
+  return recommendation.conflict_reason || `${requested.station_name || "Preferred station"} C${requested.charger_id || "-"} unavailable.`;
+}
+
 function updateTimelineDynamics(simNowMs) {
   document.querySelectorAll(".current-time-cursor").forEach((cursor) => {
     const startMs = Number(cursor.dataset.startMs);
@@ -598,7 +651,8 @@ function updateTimelineDynamics(simNowMs) {
     segment.classList.toggle("past", past);
     segment.classList.toggle("current", current);
     segment.classList.toggle("future", !past && !current);
-    segment.classList.toggle("active", status === "charging" && current);
+    const schedulerState = segment.dataset.schedulerState || status;
+    segment.classList.toggle("active", (status === "charging" || schedulerState === "active") && current);
   });
 
   document.querySelectorAll(".micro-slot").forEach((slot) => {
